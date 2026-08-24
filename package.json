@@ -1,0 +1,21 @@
+{
+  "name": "@nocobase/plugin-attachment-cleaner",
+  "displayName": "Attachment Cleaner",
+  "displayName.zh-CN": "附件清理工具",
+  "description": "Scan, analyze and clean orphaned or expired attachments in NocoBase.",
+  "description.zh-CN": "扫描、分析并清理 NocoBase 中的未引用孤立附件或过期附件。",
+  "version": "0.0.1",
+  "main": "server.js",
+  "client": "client.js",
+  "nocobase": {
+    "supportedVersions": [
+      "2.x"
+    ]
+  },
+  "peerDependencies": {
+    "@nocobase/client": "2.x",
+    "@nocobase/server": "2.x",
+    "@nocobase/test": "2.x"
+  },
+  "license": "AGPL-3.0"
+}

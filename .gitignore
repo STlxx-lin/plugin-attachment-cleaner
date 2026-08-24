@@ -1,0 +1,20 @@
+# Dependencies
+node_modules/
+
+# Build outputs
+dist/
+lib/
+coverage/
+
+# Temporary files & logs
+*.log
+.env
+
+# IDE & System
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+.trae
+.mimosa
+
