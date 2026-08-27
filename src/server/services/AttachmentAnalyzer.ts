@@ -7,15 +7,8 @@
  * For more information, please refer to: https://www.nocobase.com/agreement.
  */
 
-/**
- * This file is part of the NocoBase (R) project.
- * Copyright (c) 2020-2024 NocoBase Co., Ltd.
- * Authors: NocoBase Team.
- *
- * This project is dual-licensed under AGPL-3.0 and NocoBase Commercial License.
- * For more information, please refer to: https://www.nocobase.com/agreement.
- */
-
+import fs from 'fs';
+import path from 'path';
 import crypto from 'crypto';
 import { Database } from '@nocobase/database';
 import { Application } from '@nocobase/server';
@@ -42,6 +35,8 @@ export interface AttachmentAnalysisItem {
   duplicateCount?: number;
   isRecycled?: boolean;
   recycledAt?: Date;
+  /** 底层物理文件在磁盘中是否缺失/丢失（无效孤立记录） */
+  isMissingFile?: boolean;
 }
 
 export interface AttachmentReference {
@@ -55,6 +50,30 @@ export interface AttachmentReference {
   value: any;
 }
 
+export type ScanProgressCallback = (info: {
+  phase: 'init' | 'relations' | 'texts' | 'duplicates' | 'summary';
+  phaseText: string;
+  percent: number;
+  currentStep?: number;
+  totalSteps?: number;
+}) => void;
+
+/** 系统表或内置数据表（无需扫描附件引用） */
+const SYSTEM_COLLECTIONS = new Set([
+  'attachments',
+  'attachmentRecycleBin',
+  'attachmentCleanerSettings',
+  'attachmentCleanerAuditLogs',
+  'migrations',
+  'uiSchemas',
+  'roles',
+  'permissions',
+  'usersAuthenticators',
+  'authenticators',
+  'systemSettings',
+  'applicationPlugins',
+]);
+
 export class AttachmentAnalyzer {
   constructor(private app: Application) {}
 
@@ -62,90 +81,91 @@ export class AttachmentAnalyzer {
     return this.app.db;
   }
 
-  async findUsedAttachmentIds(): Promise<Set<string | number>> {
-    const usedIds = new Set<string | number>();
-    const collections = Array.from(this.db.collections.values());
+  /**
+   * 构建附件快速检索索引 (O(1) 内存查询)
+   */
+  private buildAttachmentIndex(allAttachments: any[]) {
+    const idSet = new Set<string | number>();
+    const filenameMap = new Map<string, string | number>();
+    const urlMap = new Map<string, string | number>();
 
-    for (const collection of collections) {
-      if (collection.name === 'attachments' || collection.name === 'attachmentRecycleBin') {
-        continue;
+    for (const att of allAttachments) {
+      const id = att.get ? att.get('id') : att.id;
+      const filename = att.get ? att.get('filename') : att.filename;
+      const url = att.get ? att.get('url') : att.url;
+
+      if (id !== undefined && id !== null) {
+        idSet.add(id);
+        idSet.add(String(id));
+      }
+      if (filename) {
+        filenameMap.set(String(filename).trim(), id);
+      }
+      if (url) {
+        urlMap.set(String(url).trim(), id);
+      }
+    }
+
+    return { idSet, filenameMap, urlMap };
+  }
+
+  /**
+   * 扫描所有业务集合中通过字段（interface: attachment 或 target: attachments）引用的附件 ID
+   */
+  async findUsedAttachmentIds(
+    allAttachments?: any[],
+    onProgress?: (info: { step: number; total: number; collectionName: string }) => void,
+  ): Promise<Set<string | number>> {
+    const usedIds = new Set<string | number>();
+    const collections = Array.from(this.db.collections.values()).filter(
+      (c) => !SYSTEM_COLLECTIONS.has(c.name) && !c.name.startsWith('system'),
+    );
+
+    const totalCollections = collections.length || 1;
+
+    // 1. 扫描关联字段
+    for (let i = 0; i < collections.length; i++) {
+      const collection = collections[i];
+      if (onProgress) {
+        onProgress({ step: i + 1, total: totalCollections, collectionName: collection.name });
       }
 
       const fields = Array.from(collection.fields.values());
-      for (const field of fields) {
-        if (field.options?.target === 'attachments' || field.options?.interface === 'attachment') {
-          try {
-            const repo = this.db.getRepository(collection.name);
-            if (!repo) continue;
+      const attachmentFields = fields.filter(
+        (f) => f.options?.target === 'attachments' || f.options?.interface === 'attachment',
+      );
+
+      if (attachmentFields.length > 0) {
+        try {
+          const repo = this.db.getRepository(collection.name);
+          if (repo) {
             const records = await repo.find({
-              appends: [field.name],
+              appends: attachmentFields.map((f) => f.name),
             });
 
             for (const record of records) {
-              const val = record.get(field.name);
-              if (!val) continue;
+              for (const field of attachmentFields) {
+                const val = record.get(field.name);
+                if (!val) continue;
 
-              if (Array.isArray(val)) {
-                for (const item of val) {
-                  if (typeof item === 'object' && item?.id) {
-                    usedIds.add(item.id);
-                  } else if (typeof item === 'number' || typeof item === 'string') {
-                    usedIds.add(item);
+                if (Array.isArray(val)) {
+                  for (const item of val) {
+                    if (typeof item === 'object' && item?.id) {
+                      usedIds.add(item.id);
+                    } else if (typeof item === 'number' || typeof item === 'string') {
+                      usedIds.add(item);
+                    }
                   }
-                }
-              } else if (typeof val === 'object' && val?.id) {
-                usedIds.add(val.id);
-              } else if (typeof val === 'number' || typeof val === 'string') {
-                usedIds.add(val);
-              }
-            }
-          } catch (e) {
-            // ignore exception
-          }
-        }
-      }
-
-      const textFields = fields.filter((f) =>
-        ['string', 'text', 'longText', 'json', 'jsonb', 'markdown'].includes(f.type),
-      );
-
-      if (textFields.length > 0) {
-        try {
-          const repo = this.db.getRepository(collection.name);
-          if (!repo) continue;
-          const records = await repo.find({
-            fields: textFields.map((f) => f.name),
-          });
-
-          for (const record of records) {
-            for (const field of textFields) {
-              const content = record.get(field.name);
-              if (!content) continue;
-              const contentStr = typeof content === 'object' ? JSON.stringify(content) : String(content);
-
-              if (contentStr.includes('/files/') || contentStr.includes('attachments')) {
-                const attachmentsRepo = this.db.getRepository('attachments');
-                if (!attachmentsRepo) continue;
-                const allAttachments = await attachmentsRepo.find({ fields: ['id', 'filename', 'url'] });
-                for (const att of allAttachments) {
-                  const attId = att.get('id');
-                  const filename = att.get('filename');
-                  const url = att.get('url');
-
-                  if (
-                    (filename && contentStr.includes(filename)) ||
-                    (url && contentStr.includes(url)) ||
-                    contentStr.includes(`/attachments/${attId}`) ||
-                    contentStr.includes(`id=${attId}`)
-                  ) {
-                    usedIds.add(attId);
-                  }
+                } else if (typeof val === 'object' && val?.id) {
+                  usedIds.add(val.id);
+                } else if (typeof val === 'number' || typeof val === 'string') {
+                  usedIds.add(val);
                 }
               }
             }
           }
         } catch (e) {
-          // ignore exception
+          // ignore exception for individual collection
         }
       }
     }
@@ -154,13 +174,105 @@ export class AttachmentAnalyzer {
   }
 
   /**
+   * 从富文本与长文本字段中扫描可能引用的附件 (使用正则快速提取 + O(1) 内存比对)
+   */
+  async scanTextReferences(
+    allAttachments: any[],
+    usedIds: Set<string | number>,
+    onProgress?: (info: { step: number; total: number; collectionName: string }) => void,
+  ): Promise<void> {
+    const { idSet, filenameMap, urlMap } = this.buildAttachmentIndex(allAttachments);
+
+    const collections = Array.from(this.db.collections.values()).filter(
+      (c) => !SYSTEM_COLLECTIONS.has(c.name) && !c.name.startsWith('system'),
+    );
+
+    const totalCollections = collections.length || 1;
+
+    // 匹配常见的附件 ID 模式与文件名/URL 模式
+    const filePatternRegex = /(?:id[=:]\s*["']?(\d+)["']?|\/attachments\/(\d+)|\/files\/([^"'\s?#<>\\]+)|\/uploads\/([^"'\s?#<>\\]+)|([a-zA-Z0-9_-]+\.[a-zA-Z0-9]+))/gi;
+
+    for (let i = 0; i < collections.length; i++) {
+      const collection = collections[i];
+      if (onProgress) {
+        onProgress({ step: i + 1, total: totalCollections, collectionName: collection.name });
+      }
+
+      const textFields = Array.from(collection.fields.values()).filter((f) =>
+        ['string', 'text', 'longText', 'json', 'jsonb', 'markdown'].includes(f.type),
+      );
+
+      if (textFields.length === 0) continue;
+
+      try {
+        const repo = this.db.getRepository(collection.name);
+        if (!repo) continue;
+
+        const records = await repo.find({
+          fields: textFields.map((f) => f.name),
+        });
+
+        for (const record of records) {
+          for (const field of textFields) {
+            const content = record.get(field.name);
+            if (!content) continue;
+
+            const contentStr = typeof content === 'object' ? JSON.stringify(content) : String(content);
+
+            // 快速粗筛：只有包含关键字或常见路径才进行深度正则提取
+            if (
+              !contentStr.includes('/files/') &&
+              !contentStr.includes('/uploads/') &&
+              !contentStr.includes('attachments') &&
+              !contentStr.includes('/api/')
+            ) {
+              continue;
+            }
+
+            // 重置正则表达式状态
+            filePatternRegex.lastIndex = 0;
+            let match: RegExpExecArray | null;
+
+            while ((match = filePatternRegex.exec(contentStr)) !== null) {
+              const matchedId1 = match[1];
+              const matchedId2 = match[2];
+              const matchedFile1 = match[3];
+              const matchedFile2 = match[4];
+              const matchedFile3 = match[5];
+
+              if (matchedId1 && idSet.has(matchedId1)) {
+                usedIds.add(isNaN(Number(matchedId1)) ? matchedId1 : Number(matchedId1));
+              }
+              if (matchedId2 && idSet.has(matchedId2)) {
+                usedIds.add(isNaN(Number(matchedId2)) ? matchedId2 : Number(matchedId2));
+              }
+              if (matchedFile1) {
+                const id = filenameMap.get(matchedFile1) ?? urlMap.get(matchedFile1);
+                if (id !== undefined) usedIds.add(id);
+              }
+              if (matchedFile2) {
+                const id = filenameMap.get(matchedFile2) ?? urlMap.get(matchedFile2);
+                if (id !== undefined) usedIds.add(id);
+              }
+              if (matchedFile3 && (matchedFile3.includes('.') || matchedFile3.length > 5)) {
+                const id = filenameMap.get(matchedFile3);
+                if (id !== undefined) usedIds.add(id);
+              }
+            }
+          }
+        }
+      } catch (e) {
+        // ignore exception for individual collection
+      }
+    }
+  }
+
+  /**
    * 扫描所有业务集合中的附件字段，构建「附件 id -> 引用条目」映射。
-   * 与 findUsedAttachmentIds 不同，这里保留了引用关系（哪条记录、哪个字段），
-   * 供去重时把被移除附件的引用改写到保留附件上。
    */
   async findAttachmentReferences(): Promise<Map<string | number, AttachmentReference[]>> {
     const refMap = new Map<string | number, AttachmentReference[]>();
-    const collections = Array.from(this.db.collections.values());
+    const collections = Array.from(this.db.collections.values()).filter((c) => !SYSTEM_COLLECTIONS.has(c.name));
 
     const addRef = (attachmentId: string | number, ref: AttachmentReference) => {
       if (attachmentId === undefined || attachmentId === null) return;
@@ -173,10 +285,6 @@ export class AttachmentAnalyzer {
     };
 
     for (const collection of collections) {
-      if (collection.name === 'attachments' || collection.name === 'attachmentRecycleBin') {
-        continue;
-      }
-
       const fields = Array.from(collection.fields.values()).filter(
         (f) => f.options?.target === 'attachments' || f.options?.interface === 'attachment',
       );
@@ -225,12 +333,18 @@ export class AttachmentAnalyzer {
     return refMap;
   }
 
-  async findDuplicateGroups(attachments: any[]): Promise<Map<string, any[]>> {
+  /**
+   * 查找重复附件组（带快速指纹优化与防超时机制）
+   */
+  async findDuplicateGroups(
+    attachments: any[],
+    onProgress?: (info: { step: number; total: number }) => void,
+  ): Promise<Map<string, any[]>> {
     const candidateGroups = new Map<string, any[]>();
 
     for (const att of attachments) {
-      const size = att.get('size') || att.size;
-      const ext = att.get('extname') || att.extname || '';
+      const size = Number(att.get ? att.get('size') : att.size) || 0;
+      const ext = String(att.get ? att.get('extname') : att.extname || '').toLowerCase();
       if (!size) continue;
 
       const key = `${size}_${ext}`;
@@ -245,27 +359,84 @@ export class AttachmentAnalyzer {
     const duplicateGroups = new Map<string, any[]>();
     const fileManagerPlugin = this.app.pm.get(PluginFileManagerServer) as PluginFileManagerServer;
 
-    for (const [, candidates] of candidateGroups.entries()) {
-      if (candidates.length < 2) continue;
+    const candidateEntries = Array.from(candidateGroups.entries()).filter(([, candidates]) => candidates.length >= 2);
+    const totalCandidates = candidateEntries.length || 1;
+
+    for (let idx = 0; idx < candidateEntries.length; idx++) {
+      const [, candidates] = candidateEntries[idx];
+      if (onProgress) {
+        onProgress({ step: idx + 1, total: totalCandidates });
+      }
 
       const hashSubGroups = new Map<string, any[]>();
+
       for (const att of candidates) {
         let fileHash = '';
         try {
           if (fileManagerPlugin) {
+            // 读取流并使用分块快速 SHA-256
             const { stream } = await fileManagerPlugin.getFileStream(att);
-            fileHash = await new Promise<string>((resolve, reject) => {
+            fileHash = await new Promise<string>((resolve) => {
               const hash = crypto.createHash('sha256');
-              stream.on('data', (chunk) => hash.update(chunk));
-              stream.on('end', () => resolve(hash.digest('hex')));
-              stream.on('error', (err) => reject(err));
+              let totalBytes = 0;
+              let isDone = false;
+              const MAX_FINGERPRINT_BYTES = 1024 * 1024;
+
+              const complete = (val: string) => {
+                if (isDone) return;
+                isDone = true;
+                resolve(val);
+              };
+
+              stream.on('data', (chunk: Buffer) => {
+                if (isDone) return;
+                totalBytes += chunk.length;
+                hash.update(chunk);
+                if (totalBytes >= MAX_FINGERPRINT_BYTES) {
+                  try {
+                    const digest = hash.digest('hex');
+                    if (typeof (stream as any).destroy === 'function') {
+                      (stream as any).destroy();
+                    }
+                    complete(`${digest}_${att.get ? att.get('size') : att.size}`);
+                  } catch (e) {
+                    complete(`${att.get ? att.get('size') : att.size}_${att.get ? att.get('filename') : att.filename}`);
+                  }
+                }
+              });
+
+              stream.on('end', () => {
+                if (!isDone) {
+                  try {
+                    complete(hash.digest('hex'));
+                  } catch (e) {
+                    complete(`${att.get ? att.get('size') : att.size}_${att.get ? att.get('filename') : att.filename}`);
+                  }
+                }
+              });
+
+              stream.on('error', () => {
+                if (!isDone) {
+                  isDone = true;
+                  resolve(`${att.get ? att.get('size') : att.size}_${att.get ? att.get('filename') : att.filename}`);
+                }
+              });
+
+              stream.on('close', () => {
+                if (!isDone) {
+                  try {
+                    complete(hash.digest('hex'));
+                  } catch (e) {
+                    complete(`${att.get ? att.get('size') : att.size}_${att.get ? att.get('filename') : att.filename}`);
+                  }
+                }
+              });
             });
           } else {
-            // 未加载 file-manager 时无法计算内容哈希，退化为按 size + filename 分组
-            fileHash = `${att.get('size')}_${att.get('filename')}`;
+            fileHash = `${att.get ? att.get('size') : att.size}_${att.get ? att.get('filename') : att.filename}`;
           }
         } catch (e) {
-          fileHash = `${att.get('size')}_${att.get('filename')}`;
+          fileHash = `${att.get ? att.get('size') : att.size}_${att.get ? att.get('filename') : att.filename}`;
         }
 
         if (fileHash) {
@@ -288,7 +459,7 @@ export class AttachmentAnalyzer {
     return duplicateGroups;
   }
 
-  async analyzeAll(): Promise<{
+  async analyzeAll(onProgress?: ScanProgressCallback): Promise<{
     items: AttachmentAnalysisItem[];
     stats: {
       totalCount: number;
@@ -298,16 +469,26 @@ export class AttachmentAnalyzer {
       duplicateCount: number;
       duplicateWastedSize: number;
       recycledCount: number;
+      missingFileCount: number;
+      missingFileSize: number;
     };
   }> {
+    if (onProgress) {
+      onProgress({
+        phase: 'init',
+        phaseText: '正在初始化扫描环境与加载附件列表...',
+        percent: 5,
+      });
+    }
+
     const attachmentsRepo = this.db.getRepository('attachments');
     const recycleRepo = this.db.getRepository('attachmentRecycleBin');
 
     const allAttachments = attachmentsRepo ? await attachmentsRepo.find({ sort: ['-createdAt'] }) : [];
     const recycledRecords = recycleRepo ? await recycleRepo.find() : [];
 
-    // 存储空间映射：storageId -> { 名称, 类型 }
-    const storageMap = new Map<string | number, { title: string; name: string; type: string }>();
+    // 存储空间映射：storageId -> { 名称, 类型, 配置 }
+    const storageMap = new Map<string | number, { title: string; name: string; type: string; options?: any }>();
     try {
       const storagesRepo = this.db.getRepository('storages');
       if (storagesRepo) {
@@ -317,6 +498,7 @@ export class AttachmentAnalyzer {
             title: s.get('title'),
             name: s.get('name'),
             type: s.get('type'),
+            options: s.get('options'),
           });
         }
       }
@@ -329,9 +511,72 @@ export class AttachmentAnalyzer {
       recycledMap.set(rec.get('attachmentId'), rec.get('recycledAt'));
     }
 
-    const usedIds = await this.findUsedAttachmentIds();
+    // 阶段 1：扫描业务集合关系字段 (10% ~ 40%)
+    if (onProgress) {
+      onProgress({
+        phase: 'relations',
+        phaseText: '正在分析业务数据关联字段...',
+        percent: 10,
+      });
+    }
+
+    const usedIds = await this.findUsedAttachmentIds(allAttachments, (info) => {
+      if (onProgress) {
+        const progressPercent = 10 + Math.floor((info.step / info.total) * 30);
+        onProgress({
+          phase: 'relations',
+          phaseText: `正在分析模型关联字段: ${info.collectionName} (${info.step}/${info.total})`,
+          percent: progressPercent,
+          currentStep: info.step,
+          totalSteps: info.total,
+        });
+      }
+    });
+
+    // 阶段 2：扫描富文本与长文本引用 (40% ~ 75%)
+    if (onProgress) {
+      onProgress({
+        phase: 'texts',
+        phaseText: '正在扫描文本与富文本中的附件引用...',
+        percent: 40,
+      });
+    }
+
+    await this.scanTextReferences(allAttachments, usedIds, (info) => {
+      if (onProgress) {
+        const progressPercent = 40 + Math.floor((info.step / info.total) * 35);
+        onProgress({
+          phase: 'texts',
+          phaseText: `正在扫描文本内容: ${info.collectionName} (${info.step}/${info.total})`,
+          percent: progressPercent,
+          currentStep: info.step,
+          totalSteps: info.total,
+        });
+      }
+    });
+
+    // 阶段 3：重复文件分析 (75% ~ 95%)
+    if (onProgress) {
+      onProgress({
+        phase: 'duplicates',
+        phaseText: '正在分析重复文件与内容指纹...',
+        percent: 75,
+      });
+    }
+
     const activeAttachments = allAttachments.filter((att) => !recycledMap.has(att.get('id')));
-    const duplicateMap = await this.findDuplicateGroups(activeAttachments);
+    const duplicateMap = await this.findDuplicateGroups(activeAttachments, (info) => {
+      if (onProgress) {
+        const progressPercent = 75 + Math.floor((info.step / info.total) * 20);
+        onProgress({
+          phase: 'duplicates',
+          phaseText: `正在比对重复文件指纹 (${info.step}/${info.total})`,
+          percent: progressPercent,
+          currentStep: info.step,
+          totalSteps: info.total,
+        });
+      }
+    });
 
     const attDuplicateGroupMap = new Map<string | number, { groupId: string; count: number }>();
     for (const [hash, items] of duplicateMap.entries()) {
@@ -343,11 +588,22 @@ export class AttachmentAnalyzer {
       }
     }
 
+    // 阶段 4：汇总与构建结果 (95% ~ 100%)
+    if (onProgress) {
+      onProgress({
+        phase: 'summary',
+        phaseText: '正在汇总统计数据并生成报告...',
+        percent: 95,
+      });
+    }
+
     let totalSize = 0;
     let unusedCount = 0;
     let unusedSize = 0;
     let duplicateCount = 0;
     let duplicateWastedSize = 0;
+    let missingFileCount = 0;
+    let missingFileSize = 0;
     const recycledCount = recycledRecords.length;
 
     const items: AttachmentAnalysisItem[] = [];
@@ -374,6 +630,41 @@ export class AttachmentAnalyzer {
       const storageId = att.get('storageId');
       const storage = storageId !== undefined && storageId !== null ? storageMap.get(storageId) : undefined;
 
+      // 检测物理文件是否存在（主要是本地存储及托管附件）
+      let isMissingFile = false;
+      const filename = att.get('filename');
+      const recPath = att.get('path');
+      if (storage?.type === 'local' || !storage || (!att.get('url') && filename)) {
+        if (filename) {
+          const docRoot = storage?.options?.documentRoot || process.env.LOCAL_STORAGE_DEST || 'storage/uploads';
+          const candidatePaths = [
+            path.resolve(process.cwd(), docRoot, recPath || '', filename),
+            path.resolve(process.cwd(), docRoot, filename),
+            path.resolve(docRoot, recPath || '', filename),
+            path.resolve(docRoot, filename),
+            path.resolve(process.cwd(), 'storage/uploads', recPath || '', filename),
+            path.resolve(process.cwd(), 'storage/uploads', filename),
+          ];
+          const exists = candidatePaths.some((p) => {
+            try {
+              return fs.existsSync(p);
+            } catch {
+              return false;
+            }
+          });
+          if (!exists) {
+            isMissingFile = true;
+          }
+        } else {
+          isMissingFile = true;
+        }
+      }
+
+      if (isMissingFile) {
+        missingFileCount++;
+        missingFileSize += size;
+      }
+
       items.push({
         id,
         title: att.get('title'),
@@ -393,6 +684,15 @@ export class AttachmentAnalyzer {
         duplicateCount: dupInfo?.count,
         isRecycled,
         recycledAt: recycledMap.get(id),
+        isMissingFile,
+      });
+    }
+
+    if (onProgress) {
+      onProgress({
+        phase: 'summary',
+        phaseText: '扫描完成',
+        percent: 100,
       });
     }
 
@@ -406,6 +706,8 @@ export class AttachmentAnalyzer {
         duplicateCount,
         duplicateWastedSize,
         recycledCount,
+        missingFileCount,
+        missingFileSize,
       },
     };
   }

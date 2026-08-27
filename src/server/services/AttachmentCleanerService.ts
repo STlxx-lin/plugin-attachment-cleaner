@@ -16,6 +16,14 @@ export interface CleanerSettings {
   retentionDays: number;
   /** 去重时优先保留的存储空间 id，不配置则按引用数/创建时间选择 */
   preferredStorageId?: number | string | null;
+  /** 是否启用后台定时自动全盘扫描 */
+  autoScanEnabled?: boolean;
+  /** 定时扫描 Cron 表达式，默认每天凌晨 3:00 (0 3 * * *) */
+  autoScanCron?: string;
+  /** 最近一次扫描分析报告快照 */
+  lastScanResult?: any;
+  /** 最近一次扫描完成时间 (ISO String) */
+  lastScannedAt?: string;
 }
 
 export interface AuditOperator {
@@ -23,11 +31,33 @@ export interface AuditOperator {
   name?: string;
 }
 
+export interface ScanTaskState {
+  taskId: string;
+  status: 'idle' | 'running' | 'completed' | 'failed';
+  phase: 'init' | 'relations' | 'texts' | 'duplicates' | 'summary';
+  phaseText: string;
+  percent: number;
+  currentStep?: number;
+  totalSteps?: number;
+  startedAt?: number;
+  completedAt?: number;
+  durationMs?: number;
+  error?: string;
+  result?: any;
+}
+
 /** 审计日志最多保留条数，超出自动裁剪最旧记录 */
 const AUDIT_LOG_LIMIT = 500;
 
 export class AttachmentCleanerService {
   private analyzer: AttachmentAnalyzer;
+  private currentScanTask: ScanTaskState = {
+    taskId: '',
+    status: 'idle',
+    phase: 'init',
+    phaseText: '空闲',
+    percent: 0,
+  };
 
   constructor(private app: Application) {
     this.analyzer = new AttachmentAnalyzer(app);
@@ -42,7 +72,62 @@ export class AttachmentCleanerService {
     if (typeof operator === 'object') {
       return { id: operator.id, name: operator.name };
     }
-    return { id: operator };
+    return { id: operator, name: String(operator) };
+  }
+
+  /**
+   * 保存最近一次全盘扫描快照到设置集合中
+   */
+  async saveScanSnapshot(result: any, completedAt: number) {
+    try {
+      const settingsRepo = this.db.getRepository('attachmentCleanerSettings');
+      if (settingsRepo) {
+        const current = await this.getSettings();
+        const updated = {
+          ...current,
+          lastScanResult: result,
+          lastScannedAt: new Date(completedAt).toISOString(),
+        };
+        const record = await settingsRepo.findOne({ filter: { key: 'config' } });
+        if (record) {
+          await settingsRepo.update({
+            filter: { key: 'config' },
+            values: { value: updated },
+          });
+        } else {
+          await settingsRepo.create({
+            values: {
+              key: 'config',
+              value: updated,
+            },
+          });
+        }
+      }
+    } catch (e) {
+      // 忽略快照保存错误
+    }
+  }
+
+  /**
+   * 获取最近一次扫描结果快照（免刷新重复全盘扫描）
+   */
+  async getLastScanResult(): Promise<{
+    hasSnapshot: boolean;
+    lastScannedAt?: string;
+    result?: any;
+    taskState: ScanTaskState;
+    settings: CleanerSettings;
+  }> {
+    const settings = await this.getSettings();
+    const taskState = this.getScanProgress();
+    const hasSnapshot = Boolean(taskState.result || settings.lastScanResult);
+    return {
+      hasSnapshot,
+      lastScannedAt: settings.lastScannedAt,
+      result: taskState.result || settings.lastScanResult,
+      taskState,
+      settings,
+    };
   }
 
   /**
@@ -62,8 +147,8 @@ export class AttachmentCleanerService {
       await repo.create({
         values: {
           action,
-          operatorId: op?.id != null ? String(op.id) : 'system',
-          operatorName: op?.name || 'system',
+          operatorId: op?.id != null ? String(op.id) : null,
+          operatorName: op?.name || null,
           params: params ?? {},
           result: result ?? {},
         },
@@ -109,8 +194,92 @@ export class AttachmentCleanerService {
     return { success: true, count };
   }
 
+  /**
+   * 获取当前扫描任务进度
+   */
+  getScanProgress(): ScanTaskState {
+    return { ...this.currentScanTask };
+  }
+
+  /**
+   * 启动全盘扫描（支持异步与同步模式）
+   */
+  async startScan(isAsync = false): Promise<ScanTaskState | any> {
+    if (this.currentScanTask.status === 'running') {
+      return this.getScanProgress();
+    }
+
+    const taskId = `scan_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    const startedAt = Date.now();
+
+    this.currentScanTask = {
+      taskId,
+      status: 'running',
+      phase: 'init',
+      phaseText: '正在准备扫描...',
+      percent: 0,
+      startedAt,
+      result: undefined,
+      error: undefined,
+    };
+
+    const runPromise = (async () => {
+      try {
+        const result = await this.analyzer.analyzeAll((progress) => {
+          this.currentScanTask = {
+            ...this.currentScanTask,
+            phase: progress.phase,
+            phaseText: progress.phaseText,
+            percent: progress.percent,
+            currentStep: progress.currentStep,
+            totalSteps: progress.totalSteps,
+          };
+        });
+
+        const completedAt = Date.now();
+        this.currentScanTask = {
+          ...this.currentScanTask,
+          status: 'completed',
+          phase: 'summary',
+          phaseText: '扫描已完成',
+          percent: 100,
+          completedAt,
+          durationMs: completedAt - startedAt,
+          result,
+        };
+
+        // 自动持久化保存最新全盘扫描报告快照
+        await this.saveScanSnapshot(result, completedAt);
+
+        return result;
+      } catch (err: any) {
+        const completedAt = Date.now();
+        this.currentScanTask = {
+          ...this.currentScanTask,
+          status: 'failed',
+          phaseText: `扫描异常中断: ${err?.message || '未知错误'}`,
+          completedAt,
+          durationMs: completedAt - startedAt,
+          error: err?.message || String(err),
+        };
+        throw err;
+      }
+    })();
+
+    if (isAsync) {
+      // 异步执行，不等待结束
+      return this.getScanProgress();
+    }
+
+    // 同步执行并直接返回分析结果
+    return runPromise;
+  }
+
+  /**
+   * 兼容旧版同步 scan 调用
+   */
   async scan() {
-    return this.analyzer.analyzeAll();
+    return this.startScan(false);
   }
 
   async recycle(
@@ -197,28 +366,34 @@ export class AttachmentCleanerService {
 
   async getSettings(): Promise<CleanerSettings> {
     const settingsRepo = this.db.getRepository('attachmentCleanerSettings');
+    const defaults: CleanerSettings = {
+      autoCleanEnabled: true,
+      retentionDays: 30,
+      preferredStorageId: null,
+      autoScanEnabled: true,
+      autoScanCron: '0 3 * * *',
+      lastScanResult: null,
+      lastScannedAt: undefined,
+    };
+
     if (!settingsRepo) {
-      return {
-        autoCleanEnabled: true,
-        retentionDays: 30,
-        preferredStorageId: null,
-      };
+      return defaults;
     }
 
     const record = await settingsRepo.findOne({ filter: { key: 'config' } });
-
     if (!record) {
-      return {
-        autoCleanEnabled: true,
-        retentionDays: 30,
-        preferredStorageId: null,
-      };
+      return defaults;
     }
 
+    const val = record.get('value') || {};
     return {
-      autoCleanEnabled: record.get('value')?.autoCleanEnabled ?? true,
-      retentionDays: record.get('value')?.retentionDays ?? 30,
-      preferredStorageId: record.get('value')?.preferredStorageId ?? null,
+      autoCleanEnabled: val.autoCleanEnabled ?? defaults.autoCleanEnabled,
+      retentionDays: val.retentionDays ?? defaults.retentionDays,
+      preferredStorageId: val.preferredStorageId ?? defaults.preferredStorageId,
+      autoScanEnabled: val.autoScanEnabled ?? defaults.autoScanEnabled,
+      autoScanCron: val.autoScanCron || defaults.autoScanCron,
+      lastScanResult: val.lastScanResult ?? null,
+      lastScannedAt: val.lastScannedAt ?? undefined,
     };
   }
 

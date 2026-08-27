@@ -27,6 +27,24 @@ export function registerCleanerActions(plugin: PluginAttachmentCleanerServer) {
         await next();
       },
 
+      async startScan(ctx: Context, next: () => Promise<void>) {
+        const result = await plugin.cleanerService.startScan(true);
+        ctx.body = result;
+        await next();
+      },
+
+      async getScanProgress(ctx: Context, next: () => Promise<void>) {
+        const result = plugin.cleanerService.getScanProgress();
+        ctx.body = result;
+        await next();
+      },
+
+      async getLastScanResult(ctx: Context, next: () => Promise<void>) {
+        const result = await plugin.cleanerService.getLastScanResult();
+        ctx.body = result;
+        await next();
+      },
+
       async recycle(ctx: Context, next: () => Promise<void>) {
         const { attachmentIds } = ctx.action.params?.values || ctx.request.body || {};
         if (!Array.isArray(attachmentIds) || attachmentIds.length === 0) {
