@@ -25,9 +25,8 @@ import {
   Select,
   Space,
 } from 'antd';
-import { DeleteOutlined, UndoOutlined, RestOutlined, SyncOutlined, SettingOutlined, EyeOutlined } from '@ant-design/icons';
+import { DeleteOutlined, UndoOutlined, RestOutlined, SyncOutlined, SettingOutlined, EyeOutlined, DownloadOutlined, ExportOutlined, FileOutlined } from '@ant-design/icons';
 import { useAPIClient } from '@nocobase/client';
-import { KKFilePreviewer } from '@nocobase/plugin-file-previewer-kkfileview/client';
 
 export const AttachmentCleanerPage: React.FC = () => {
   const api = useAPIClient();
@@ -621,20 +620,100 @@ export const AttachmentCleanerPage: React.FC = () => {
         </Form>
       </Modal>
 
-      <KKFilePreviewer
+      <Modal
+        title={previewFile?.title || previewFile?.filename || '附件预览'}
         open={previewOpen}
-        file={
-          previewFile
-            ? {
-                url: previewFile.url,
-                extname: previewFile.extname,
-                title: previewFile.title || previewFile.filename,
-              }
-            : undefined
-        }
-        onOpenChange={setPreviewOpen}
-        onClose={() => setPreviewOpen(false)}
-      />
+        footer={[
+          previewFile?.url && (
+            <Button
+              key="download"
+              icon={<DownloadOutlined />}
+              onClick={() => {
+                const a = document.createElement('a');
+                a.href = previewFile.url;
+                a.download = previewFile.title || previewFile.filename || 'download';
+                a.target = '_blank';
+                a.rel = 'noreferrer';
+                document.body.appendChild(a);
+                a.click();
+                document.body.removeChild(a);
+              }}
+            >
+              下载文件
+            </Button>
+          ),
+          previewFile?.url && (
+            <Button
+              key="open"
+              type="primary"
+              icon={<ExportOutlined />}
+              onClick={() => window.open(previewFile.url, '_blank')}
+            >
+              新窗口打开
+            </Button>
+          ),
+          <Button key="close" onClick={() => setPreviewOpen(false)}>
+            关闭
+          </Button>,
+        ]}
+        onCancel={() => setPreviewOpen(false)}
+        width={750}
+        styles={{ body: { maxHeight: '75vh', overflow: 'auto', textAlign: 'center', padding: '16px 0' } }}
+      >
+        {previewFile?.url ? (
+          (() => {
+            const ext = (previewFile.extname || '').toLowerCase().replace(/^\./, '');
+            const imgExts = ['jpg', 'jpeg', 'png', 'gif', 'svg', 'webp', 'bmp', 'ico'];
+            const videoExts = ['mp4', 'webm', 'ogg', 'mov'];
+            const audioExts = ['mp3', 'wav', 'aac', 'flac'];
+            const isPdf = ext === 'pdf';
+
+            if (imgExts.includes(ext)) {
+              return (
+                <div style={{ padding: '8px' }}>
+                  <img
+                    src={previewFile.url}
+                    alt={previewFile.title || previewFile.filename}
+                    style={{ maxWidth: '100%', maxHeight: '60vh', objectFit: 'contain', borderRadius: '4px' }}
+                  />
+                </div>
+              );
+            }
+            if (videoExts.includes(ext)) {
+              return (
+                <div style={{ padding: '8px' }}>
+                  <video src={previewFile.url} controls style={{ maxWidth: '100%', maxHeight: '60vh' }} />
+                </div>
+              );
+            }
+            if (audioExts.includes(ext)) {
+              return (
+                <div style={{ padding: '24px' }}>
+                  <audio src={previewFile.url} controls style={{ width: '100%' }} />
+                </div>
+              );
+            }
+            if (isPdf) {
+              return (
+                <iframe
+                  src={previewFile.url}
+                  title="PDF Preview"
+                  style={{ width: '100%', height: '60vh', border: '1px solid #eee', borderRadius: '4px' }}
+                />
+              );
+            }
+            return (
+              <div style={{ padding: '40px 16px', color: '#666' }}>
+                <FileOutlined style={{ fontSize: 48, color: '#1890ff', marginBottom: 16 }} />
+                <p style={{ fontSize: 16, fontWeight: 500, margin: '8px 0' }}>{previewFile.title || previewFile.filename}</p>
+                <p style={{ color: '#999', fontSize: 13 }}>当前格式（.{ext || '未知'}）暂不支持内嵌直接渲染，请点击下方按钮下载或在新窗口中打开。</p>
+              </div>
+            );
+          })()
+        ) : (
+          <div style={{ padding: '32px', color: '#999' }}>暂无有效的文件链接</div>
+        )}
+      </Modal>
     </div>
   );
 };
