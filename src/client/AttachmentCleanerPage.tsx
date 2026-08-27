@@ -18,6 +18,9 @@ import {
   Tabs,
   Tag,
   Modal,
+  Drawer,
+  Descriptions,
+  Typography,
   message,
   Form,
   InputNumber,
@@ -26,7 +29,10 @@ import {
   Select,
   Space,
   Progress,
+  Alert,
   Tooltip,
+  Badge,
+  Upload,
 } from 'antd';
 import {
   DeleteOutlined,
@@ -40,12 +46,25 @@ import {
   FileOutlined,
   LoadingOutlined,
   ClockCircleOutlined,
+  PauseCircleOutlined,
+  PlayCircleOutlined,
+  CloseCircleOutlined,
+  ThunderboltOutlined,
+  UpOutlined,
+  DownOutlined,
+  SwapOutlined,
+  InboxOutlined,
+  UploadOutlined,
+  CopyOutlined,
+  SearchOutlined,
+  FilterOutlined,
+  InfoCircleOutlined,
 } from '@ant-design/icons';
 import { useAPIClient, attachmentFileTypes } from '@nocobase/client';
 
 interface ScanProgressInfo {
   taskId: string;
-  status: 'idle' | 'running' | 'completed' | 'failed';
+  status: 'idle' | 'running' | 'paused' | 'completed' | 'failed';
   phase: string;
   phaseText: string;
   percent: number;
@@ -56,12 +75,23 @@ interface ScanProgressInfo {
   durationMs?: number;
   error?: string;
   result?: any;
+  checkpoint?: any;
 }
 
 export const AttachmentCleanerPage: React.FC = () => {
   const api = useAPIClient();
-  const [loading, setLoading] = useState(false);
   const [lastScannedAt, setLastScannedAt] = useState<string | null>(null);
+  const [checkpoint, setCheckpoint] = useState<any>(null);
+  const [minimizedProgress, setMinimizedProgress] = useState(false);
+
+  // 文件替换弹窗状态
+  const [replaceModalOpen, setReplaceModalOpen] = useState(false);
+  const [currentReplaceRecord, setCurrentReplaceRecord] = useState<any>(null);
+  const [replaceMode, setReplaceMode] = useState<'upload' | 'reference'>('upload');
+  const [replaceUploadFile, setReplaceUploadFile] = useState<File | null>(null);
+  const [replaceTargetId, setReplaceTargetId] = useState<string | number | undefined>(undefined);
+  const [recycleSourceAtt, setRecycleSourceAtt] = useState(true);
+  const [replaceSubmitting, setReplaceSubmitting] = useState(false);
 
   const [data, setData] = useState<{
     items: any[];
@@ -110,6 +140,10 @@ export const AttachmentCleanerPage: React.FC = () => {
   const [previewFile, setPreviewFile] = useState<any>(null);
   const [auditLogs, setAuditLogs] = useState<any[]>([]);
   const [auditLoading, setAuditLoading] = useState(false);
+  const [auditDrawerOpen, setAuditDrawerOpen] = useState(false);
+  const [currentAuditLog, setCurrentAuditLog] = useState<any>(null);
+  const [auditFilterAction, setAuditFilterAction] = useState<string>('all');
+  const [auditSearchText, setAuditSearchText] = useState<string>('');
   const [storages, setStorages] = useState<{ id: string | number; title?: string; name?: string; type?: string }[]>([]);
 
   // NocoBase 会把 action 响应包为 { data: <body> }，这里取里面的真实载荷
@@ -145,9 +179,9 @@ export const AttachmentCleanerPage: React.FC = () => {
     });
   };
 
-  const startScan = async () => {
+  // 纯后台异步扫描：立即返回，不锁死前台 UI
+  const startScan = async (resume = false) => {
     stopPolling();
-    setLoading(true);
     setElapsedTime(0);
 
     const startTime = Date.now();
@@ -159,13 +193,21 @@ export const AttachmentCleanerPage: React.FC = () => {
       const res = await api.request({
         url: 'attachmentCleaners:startScan',
         method: 'post',
+        data: { resume },
       });
       const initialProgress = unwrapBody(res);
       if (initialProgress) {
         setScanProgress(initialProgress);
       }
 
-      // 启动轮询检查进度
+      message.info({
+        content: resume
+          ? '已在后台恢复断点续扫，您可以随时进行其他操作...'
+          : '全盘扫描任务已在后台独立运行，您可以随时离开或进行其他操作...',
+        key: 'scanNotice',
+      });
+
+      // 启动轻量轮询获取进度（仅用于刷新进度条，不阻塞页面交互）
       pollTimerRef.current = setInterval(async () => {
         try {
           const pRes = await api.request({
@@ -178,28 +220,74 @@ export const AttachmentCleanerPage: React.FC = () => {
 
           if (progress.status === 'completed') {
             stopPolling();
-            setLoading(false);
+            setCheckpoint(null);
             if (progress.result) {
               applyAnalysisResult(progress.result);
               setLastScannedAt(new Date().toLocaleString());
             }
             message.success(
-              `全盘扫描完成！耗时 ${((progress.durationMs || Date.now() - startTime) / 1000).toFixed(1)} 秒`,
+              `后台全盘扫描已完成！耗时 ${((progress.durationMs || Date.now() - startTime) / 1000).toFixed(1)} 秒`,
             );
+          } else if (progress.status === 'paused') {
+            stopPolling();
+            if (progress.checkpoint) {
+              setCheckpoint(progress.checkpoint);
+            }
+            message.info('后台扫描任务已暂停，断点已安全保存');
           } else if (progress.status === 'failed') {
             stopPolling();
-            setLoading(false);
-            message.error(progress.error || '扫描中断失败');
+            message.error(progress.error || '后台扫描中断失败');
           }
         } catch (pollErr) {
           // 容忍单次轮询网络抖动
         }
-      }, 400);
+      }, 500);
     } catch (e: any) {
       stopPolling();
-      setLoading(false);
       message.error(e?.message || '启动全盘扫描失败');
     }
+  };
+
+  const handlePauseScan = async () => {
+    try {
+      await api.request({
+        url: 'attachmentCleaners:pauseScan',
+        method: 'post',
+      });
+      message.loading({ content: '正在暂停后台扫描并保存检查点...', key: 'pauseScan' });
+    } catch (e: any) {
+      message.error(e?.message || '暂停扫描失败');
+    }
+  };
+
+  const handleCancelScan = async () => {
+    Modal.confirm({
+      title: '确认取消后台扫描任务？',
+      content: '取消后将清空当前已记录的扫描断点进度。',
+      okText: '确认取消',
+      okType: 'danger',
+      cancelText: '关闭',
+      onOk: async () => {
+        try {
+          stopPolling();
+          await api.request({
+            url: 'attachmentCleaners:cancelScan',
+            method: 'post',
+          });
+          setCheckpoint(null);
+          setScanProgress({
+            taskId: '',
+            status: 'idle',
+            phase: 'init',
+            phaseText: '空闲',
+            percent: 0,
+          });
+          message.success('后台扫描任务已取消');
+        } catch (e: any) {
+          message.error(e?.message || '取消扫描失败');
+        }
+      },
+    });
   };
 
   const fetchSettings = async () => {
@@ -216,9 +304,7 @@ export const AttachmentCleanerPage: React.FC = () => {
           autoScanPreset: isStandard ? cron : 'custom',
         });
       }
-    } catch (e) {
-      // ignore settings fetch error
-    }
+    } catch (e) {}
   };
 
   const fetchAuditLogs = async () => {
@@ -230,7 +316,6 @@ export const AttachmentCleanerPage: React.FC = () => {
       const payload = unwrapBody(res);
       setAuditLogs(Array.isArray(payload?.items) ? payload.items : []);
     } catch (e) {
-      // ignore audit fetch error
     } finally {
       setAuditLoading(false);
     }
@@ -243,12 +328,10 @@ export const AttachmentCleanerPage: React.FC = () => {
       });
       const payload = unwrapBody(res);
       setStorages(Array.isArray(payload?.items) ? payload.items : []);
-    } catch (e) {
-      // ignore storages fetch error
-    }
+    } catch (e) {}
   };
 
-  // 页面初次加载时拉取快照（秒开），不再自动重新执行耗时扫描
+  // 页面加载时拉取快照与断点检查点（秒开，无缝重连后台任务，绝不重复触发扫描）
   useEffect(() => {
     const initLoad = async () => {
       try {
@@ -260,10 +343,19 @@ export const AttachmentCleanerPage: React.FC = () => {
             setLastScannedAt(new Date(payload.lastScannedAt).toLocaleString());
           }
 
-          // 如果后台有正在运行的扫描任务，接入轮询进度条
+          if (payload.checkpoint) {
+            setCheckpoint(payload.checkpoint);
+          }
+
+          // 如果后台有正在运行的异步任务，无缝接入轮询与计时器，绝对不重复启动扫描！
           if (payload.taskState && payload.taskState.status === 'running') {
             setScanProgress(payload.taskState);
-            setLoading(true);
+            const startedAt = payload.taskState.startedAt || Date.now();
+            setElapsedTime(Math.max(0, Math.floor((Date.now() - startedAt) / 1000)));
+            elapsedTimerRef.current = setInterval(() => {
+              setElapsedTime(Math.max(0, Math.floor((Date.now() - startedAt) / 1000)));
+            }, 1000);
+
             pollTimerRef.current = setInterval(async () => {
               try {
                 const pRes = await api.request({ url: 'attachmentCleaners:getScanProgress' });
@@ -272,17 +364,27 @@ export const AttachmentCleanerPage: React.FC = () => {
                 setScanProgress(curProgress);
                 if (curProgress.status === 'completed') {
                   stopPolling();
-                  setLoading(false);
+                  setCheckpoint(null);
                   if (curProgress.result) {
                     applyAnalysisResult(curProgress.result);
                     setLastScannedAt(new Date().toLocaleString());
                   }
+                  message.success('后台全盘扫描已完成！');
+                } else if (curProgress.status === 'paused') {
+                  stopPolling();
+                  if (curProgress.checkpoint) setCheckpoint(curProgress.checkpoint);
+                  message.info('后台扫描任务已暂停');
                 } else if (curProgress.status === 'failed') {
                   stopPolling();
-                  setLoading(false);
+                  message.error(curProgress.error || '后台扫描中断失败');
                 }
               } catch (err) {}
-            }, 400);
+            }, 500);
+
+            // 如果有之前留存的快照数据，也可先呈现
+            if (payload.hasSnapshot && payload.result) {
+              applyAnalysisResult(payload.result);
+            }
             return;
           }
 
@@ -293,9 +395,6 @@ export const AttachmentCleanerPage: React.FC = () => {
           }
         }
       } catch (err) {}
-
-      // 若系统初次安装且没有任何快照，则进行一次初始扫描
-      startScan();
     };
 
     initLoad();
@@ -317,7 +416,7 @@ export const AttachmentCleanerPage: React.FC = () => {
       message.success('已放入回收站');
       setSelectedRowKeys([]);
 
-      // 本地即时响应更新，不触发耗时全盘扫描
+      // 本地瞬时更新状态
       setData((prev) => {
         const idSet = new Set(ids.map(String));
         let unusedCountDelta = 0;
@@ -360,7 +459,7 @@ export const AttachmentCleanerPage: React.FC = () => {
       message.success('已还原');
       setSelectedRowKeys([]);
 
-      // 本地即时响应更新，不触发耗时全盘扫描
+      // 本地瞬时更新状态
       setData((prev) => {
         const idSet = new Set(ids.map(String));
         let unusedCountDelta = 0;
@@ -410,7 +509,7 @@ export const AttachmentCleanerPage: React.FC = () => {
           message.success('已物理擦除');
           setSelectedRowKeys([]);
 
-          // 本地即时从列表中剔除并更新统计，不触发耗时全盘扫描
+          // 本地瞬时从列表中剔除并更新统计
           setData((prev) => {
             const idSet = new Set(ids.map(String));
             let removedTotalSize = 0;
@@ -485,7 +584,6 @@ export const AttachmentCleanerPage: React.FC = () => {
             `去重完成：处理 ${payload?.groups ?? 0} 组，保留 ${payload?.keptCount ?? 0} 个，移除 ${payload?.removedCount ?? 0} 个附件，更新 ${payload?.referencesUpdated ?? 0} 处引用`,
           );
           setSelectedRowKeys([]);
-          // 去重后轻量刷新最新快照结果
           const snapshotRes = await api.request({ url: 'attachmentCleaners:getLastScanResult' });
           const snapPayload = unwrapBody(snapshotRes);
           if (snapPayload?.result) {
@@ -544,6 +642,169 @@ export const AttachmentCleanerPage: React.FC = () => {
     });
   };
 
+  // 打开文件替换弹窗
+  const openReplaceModal = (record: any) => {
+    setCurrentReplaceRecord(record);
+    setReplaceMode('upload');
+    setReplaceUploadFile(null);
+    setReplaceTargetId(undefined);
+    setRecycleSourceAtt(true);
+    setReplaceModalOpen(true);
+  };
+
+  // 执行文件替换（优先通过系统标准 attachments:create 接口上传，然后原地覆盖或迁移）
+  const handleExecuteReplace = async () => {
+    if (!currentReplaceRecord) return;
+    setReplaceSubmitting(true);
+
+    try {
+      if (replaceMode === 'upload') {
+        if (!replaceUploadFile) {
+          message.warning('请选择需要上传的文件');
+          setReplaceSubmitting(false);
+          return;
+        }
+
+        message.loading({ content: '正在通过系统接口上传新文件...', key: 'replaceUpload' });
+
+        let createdAtt: any = null;
+
+        // 1. 优先使用系统标准 attachments:create / FormData 接口上传
+        try {
+          const formData = new FormData();
+          formData.append('file', replaceUploadFile);
+          const uploadRes = await api.request({
+            url: 'attachments:create',
+            method: 'post',
+            data: formData,
+            headers: {
+              'Content-Type': 'multipart/form-data',
+            },
+          });
+          createdAtt = unwrapBody(uploadRes);
+        } catch (uploadErr) {
+          // 容错降级：若直接调用 attachments:create 报错，回退到 Base64 方式直接上传覆盖
+        }
+
+        let payload: any = null;
+
+        if (createdAtt && createdAtt.id) {
+          // 2. 通过系统生成的新附件记录，将物理文件与属性原地合并覆盖到当前附件上
+          const res = await api.request({
+            url: 'attachmentCleaners:replaceWithAttachment',
+            method: 'post',
+            data: {
+              oldAttachmentId: currentReplaceRecord.id,
+              newAttachmentId: createdAtt.id,
+              mode: 'overwrite',
+            },
+          });
+          payload = unwrapBody(res);
+        } else {
+          // 3. 降级 Base64 方式
+          const reader = new FileReader();
+          const base64Promise = new Promise<string>((resolve, reject) => {
+            reader.onload = () => resolve(reader.result as string);
+            reader.onerror = reject;
+          });
+          reader.readAsDataURL(replaceUploadFile);
+          const base64Data = await base64Promise;
+
+          const res = await api.request({
+            url: 'attachmentCleaners:replaceFile',
+            method: 'post',
+            data: {
+              attachmentId: currentReplaceRecord.id,
+              originalFilename: replaceUploadFile.name,
+              mimetype: replaceUploadFile.type,
+              size: replaceUploadFile.size,
+              fileBase64: base64Data,
+            },
+          });
+          payload = unwrapBody(res);
+        }
+
+        message.success({ content: '文件覆盖替换成功！全部列表与业务引用已即时更新。', key: 'replaceUpload' });
+
+        const finalItem = payload?.item || payload;
+
+        // 本地状态列表乐观更新（如果原项存在则更新，若不存在则追加到列表首位）
+        setData((prev) => {
+          let updated = false;
+          const newItems = prev.items.map((item) => {
+            if (String(item.id) === String(currentReplaceRecord.id)) {
+              updated = true;
+              return {
+                ...item,
+                ...finalItem,
+                title: finalItem?.newTitle || finalItem?.title || replaceUploadFile.name,
+                filename: finalItem?.newFilename || finalItem?.filename || replaceUploadFile.name,
+                size: finalItem?.newSize || finalItem?.size || replaceUploadFile.size,
+                extname: finalItem?.extname || item.extname,
+                mimetype: finalItem?.mimetype || replaceUploadFile.type,
+                url: finalItem?.url || item.url,
+                isMissingFile: false,
+                isRecycled: false,
+                updatedAt: finalItem?.updatedAt || new Date(),
+              };
+            }
+            return item;
+          });
+
+          if (!updated && finalItem) {
+            newItems.unshift({
+              ...currentReplaceRecord,
+              ...finalItem,
+              title: finalItem?.newTitle || finalItem?.title || replaceUploadFile.name,
+              filename: finalItem?.newFilename || finalItem?.filename || replaceUploadFile.name,
+              size: finalItem?.newSize || finalItem?.size || replaceUploadFile.size,
+              isMissingFile: false,
+              isRecycled: false,
+              updatedAt: new Date(),
+            });
+          }
+
+          return {
+            ...prev,
+            items: newItems,
+          };
+        });
+      } else {
+        if (!replaceTargetId) {
+          message.warning('请选择目标附件');
+          setReplaceSubmitting(false);
+          return;
+        }
+
+        const res = await api.request({
+          url: 'attachmentCleaners:replaceReference',
+          method: 'post',
+          data: {
+            sourceAttachmentId: currentReplaceRecord.id,
+            targetAttachmentId: replaceTargetId,
+            recycleSource: recycleSourceAtt,
+          },
+        });
+
+        const payload = unwrapBody(res);
+        message.success(`引用迁移成功！已更新 ${payload?.referencesUpdated || 0} 处业务引用。`);
+
+        if (recycleSourceAtt) {
+          handleRecycle([currentReplaceRecord.id]);
+        }
+      }
+
+      setReplaceModalOpen(false);
+      setReplaceUploadFile(null);
+      setReplaceTargetId(undefined);
+      fetchAuditLogs();
+    } catch (e: any) {
+      message.error({ content: e?.message || '文件替换失败', key: 'replaceUpload' });
+    } finally {
+      setReplaceSubmitting(false);
+    }
+  };
+
   const formatSize = (bytes: number) => {
     if (!bytes) return '0 B';
     const k = 1024;
@@ -574,24 +835,32 @@ export const AttachmentCleanerPage: React.FC = () => {
       title: '文件名',
       dataIndex: 'filename',
       key: 'filename',
-      render: (text: string, record: any) => record.title || record.filename,
+      ellipsis: true,
+      render: (text: string, record: any) => (
+        <Tooltip title={record.title || record.filename}>
+          <span style={{ fontWeight: 500 }}>{record.title || record.filename}</span>
+        </Tooltip>
+      ),
     },
     {
       title: '大小',
       dataIndex: 'size',
       key: 'size',
+      width: 110,
       render: (size: number) => formatSize(size),
     },
     {
       title: '扩展名',
       dataIndex: 'extname',
       key: 'extname',
+      width: 90,
       render: (ext: string) => <Tag color="blue">{ext || '未知'}</Tag>,
     },
     {
       title: '存储空间',
       dataIndex: 'storageName',
       key: 'storageName',
+      width: 160,
       render: (_: string, record: any) =>
         record.storageName ? (
           <Space>
@@ -599,12 +868,13 @@ export const AttachmentCleanerPage: React.FC = () => {
             {record.storageType && <Tag>{record.storageType}</Tag>}
           </Space>
         ) : (
-          <span style={{ color: '#999' }}>未知</span>
+          <span style={{ color: '#999' }}>默认存储</span>
         ),
     },
     {
       title: '状态标记',
       key: 'tags',
+      width: 150,
       render: (_: any, record: any) => (
         <Space wrap>
           {record.isUnused && <Tag color="warning">未被引用</Tag>}
@@ -618,13 +888,16 @@ export const AttachmentCleanerPage: React.FC = () => {
       title: '创建时间',
       dataIndex: 'createdAt',
       key: 'createdAt',
+      width: 170,
       render: (val: string) => (val ? new Date(val).toLocaleString() : '-'),
     },
     {
       title: '操作',
       key: 'action',
+      width: 250,
+      fixed: 'right' as const,
       render: (_: any, record: any) => (
-        <Space>
+        <Space size={6} wrap={false}>
           <Button
             size="small"
             icon={<EyeOutlined />}
@@ -632,7 +905,7 @@ export const AttachmentCleanerPage: React.FC = () => {
             title={record.isMissingFile ? '物理文件在磁盘中已丢失（404），无法预览' : undefined}
             onClick={() => {
               if (record.isMissingFile) {
-                message.warning('该附件物理文件在磁盘中已丢失，无法预览，建议放入回收站清理。');
+                message.warning('该附件物理文件在磁盘中已丢失，无法预览，可点击【替换】重新上传修复。');
                 return;
               }
               openFilePreview(record);
@@ -640,6 +913,17 @@ export const AttachmentCleanerPage: React.FC = () => {
           >
             预览
           </Button>
+
+          {/* 核心文件替换按钮 */}
+          <Button
+            size="small"
+            icon={<SwapOutlined />}
+            onClick={() => openReplaceModal(record)}
+            title="替换附件物理文件或迁移引用"
+          >
+            替换
+          </Button>
+
           {!record.isRecycled ? (
             <Button size="small" icon={<DeleteOutlined />} onClick={() => handleRecycle([record.id])}>
               放入回收站
@@ -650,7 +934,7 @@ export const AttachmentCleanerPage: React.FC = () => {
                 还原
               </Button>
               <Button size="small" danger icon={<RestOutlined />} onClick={() => handlePurge([record.id])}>
-                彻底物理删除
+                彻底删除
               </Button>
             </>
           )}
@@ -662,16 +946,139 @@ export const AttachmentCleanerPage: React.FC = () => {
   const auditActionMeta: Record<string, { label: string; color: string }> = {
     recycle: { label: '移入回收站', color: 'orange' },
     restore: { label: '还原', color: 'blue' },
-    purge: { label: '物理擦除', color: 'red' },
-    deduplicate: { label: '去重', color: 'magenta' },
+    purge: { label: '彻底物理删除', color: 'red' },
+    deduplicate: { label: '重复文件去重', color: 'magenta' },
+    replaceFile: { label: '文件覆盖替换', color: 'cyan' },
+    replaceReference: { label: '引用迁移替换', color: 'purple' },
     updateSettings: { label: '修改配置', color: 'geekblue' },
-    autoCleanExpired: { label: '自动清理', color: 'default' },
+    autoCleanExpired: { label: '自动定时清理', color: 'default' },
   };
 
-  const summarize = (v: any) => {
-    if (v === null || v === undefined) return '-';
-    const s = typeof v === 'string' ? v : JSON.stringify(v);
-    return s.length > 80 ? s.slice(0, 80) + '…' : s;
+  const renderAuditParams = (action: string, params: any) => {
+    if (!params) return <span style={{ color: '#999' }}>-</span>;
+    const ids = params.attachmentIds || (params.attachmentId !== undefined ? [params.attachmentId] : []);
+
+    switch (action) {
+      case 'recycle':
+      case 'restore':
+      case 'purge':
+        return (
+          <Space size={6} wrap>
+            <Tag color={action === 'purge' ? 'red' : action === 'restore' ? 'blue' : 'orange'}>
+              共 {ids.length} 项
+            </Tag>
+            <span style={{ color: '#555', fontSize: 12 }}>
+              IDs: {ids.slice(0, 6).join(', ')}{ids.length > 6 ? '…' : ''}
+            </span>
+          </Space>
+        );
+      case 'deduplicate':
+        return (
+          <Space size={6} wrap>
+            <Tag color="magenta">去重分析</Tag>
+            {params.preferredStorageId && (
+              <span style={{ color: '#555', fontSize: 12 }}>首选存储 ID: #{params.preferredStorageId}</span>
+            )}
+            {params.duplicateGroupIds && (
+              <span style={{ color: '#555', fontSize: 12 }}>指定组: {params.duplicateGroupIds.length} 组</span>
+            )}
+          </Space>
+        );
+      case 'replaceFile':
+        return (
+          <Space size={6} wrap>
+            <Tag color="cyan">目标 #{params.attachmentId}</Tag>
+            <span style={{ fontSize: 12 }}>
+              新文件: <strong>{params.newFilename || params.originalFilename || '新文件'}</strong>
+              {params.actualSize ? ` (${formatSize(params.actualSize)})` : ''}
+            </span>
+          </Space>
+        );
+      case 'replaceReference':
+        return (
+          <Space size={6} wrap>
+            <Tag color="purple">#{params.sourceAttachmentId} ➔ #{params.targetAttachmentId}</Tag>
+            {params.recycleSource && <Tag color="default">回收源文件</Tag>}
+          </Space>
+        );
+      case 'updateSettings':
+        return (
+          <Space size={6} wrap>
+            {params.autoCleanEnabled !== undefined && (
+              <Tag color={params.autoCleanEnabled ? 'green' : 'default'}>
+                {params.autoCleanEnabled ? `自动清理开启 (${params.retentionDays || 30}天)` : '自动清理关闭'}
+              </Tag>
+            )}
+            {params.preferredStorageId && <Tag>首选存储 #{params.preferredStorageId}</Tag>}
+          </Space>
+        );
+      default: {
+        const str = typeof params === 'string' ? params : JSON.stringify(params);
+        return (
+          <Tooltip title={str}>
+            <span style={{ color: '#555', fontSize: 12, wordBreak: 'break-all' }}>
+              {str.length > 50 ? str.slice(0, 50) + '…' : str}
+            </span>
+          </Tooltip>
+        );
+      }
+    }
+  };
+
+  const renderAuditResult = (action: string, result: any) => {
+    if (!result) return <span style={{ color: '#999' }}>-</span>;
+
+    switch (action) {
+      case 'recycle':
+        return <Tag color="success">成功移入 {result.count ?? 0} 项</Tag>;
+      case 'restore':
+        return <Tag color="success">成功还原 {result.count ?? 0} 项</Tag>;
+      case 'purge':
+        return <Tag color="success">成功物理删除 {result.count ?? 0} 项</Tag>;
+      case 'deduplicate':
+        return (
+          <Space size={6} wrap>
+            <Badge status="success" />
+            <span style={{ fontWeight: 500 }}>处理 {result.groups ?? 0} 组</span>
+            <Tag color="cyan">保留 {result.keptCount ?? 0}</Tag>
+            <Tag color="volcano">清理 {result.removedCount ?? 0}</Tag>
+            <Tag color="purple">更新 {result.referencesUpdated ?? 0} 处引用</Tag>
+          </Space>
+        );
+      case 'replaceFile':
+        return (
+          <Space size={6} wrap>
+            <Badge status="success" />
+            <span style={{ fontWeight: 500 }}>覆盖成功</span>
+            {result.oldTitle && result.newTitle && (
+              <span style={{ color: '#666', fontSize: 12 }}>
+                ({result.oldTitle} ➔ {result.newTitle})
+              </span>
+            )}
+          </Space>
+        );
+      case 'replaceReference':
+        return (
+          <Space size={6} wrap>
+            <Badge status="success" />
+            <span style={{ fontWeight: 500 }}>迁移成功</span>
+            <Tag color="purple">更新 {result.referencesUpdated ?? 0} 处引用</Tag>
+          </Space>
+        );
+      case 'updateSettings':
+        return <Tag color="success">配置已更新生效</Tag>;
+      default:
+        return (
+          <Tag color={result.success !== false ? 'success' : 'error'}>
+            {result.success !== false ? '操作成功' : (result.message || '操作失败')}
+          </Tag>
+        );
+    }
+  };
+
+  const openAuditDetail = (record: any) => {
+    setCurrentAuditLog(record);
+    setAuditDrawerOpen(true);
   };
 
   const auditColumns = [
@@ -679,21 +1086,21 @@ export const AttachmentCleanerPage: React.FC = () => {
       title: '时间',
       dataIndex: 'createdAt',
       key: 'createdAt',
-      width: 180,
+      width: 170,
       render: (val: string) => (val ? new Date(val).toLocaleString() : '-'),
     },
     {
       title: '操作人',
       dataIndex: 'operatorName',
       key: 'operatorName',
-      width: 140,
+      width: 130,
       render: (_: string, record: any) => record.operatorName || record.operatorId || 'system',
     },
     {
       title: '动作',
       dataIndex: 'action',
       key: 'action',
-      width: 120,
+      width: 130,
       render: (action: string) => {
         const meta = auditActionMeta[action];
         return <Tag color={meta?.color}>{meta?.label || action}</Tag>;
@@ -703,17 +1110,45 @@ export const AttachmentCleanerPage: React.FC = () => {
       title: '参数',
       dataIndex: 'params',
       key: 'params',
-      render: (v: any) => <span style={{ wordBreak: 'break-all' }}>{summarize(v)}</span>,
+      render: (v: any, record: any) => renderAuditParams(record.action, v),
     },
     {
       title: '结果',
       dataIndex: 'result',
       key: 'result',
-      render: (v: any) => <span style={{ wordBreak: 'break-all' }}>{summarize(v)}</span>,
+      render: (v: any, record: any) => renderAuditResult(record.action, v),
+    },
+    {
+      title: '操作',
+      key: 'action',
+      width: 90,
+      fixed: 'right' as const,
+      render: (_: any, record: any) => (
+        <Button size="small" icon={<InfoCircleOutlined />} onClick={() => openAuditDetail(record)}>
+          详情
+        </Button>
+      ),
     },
   ];
 
-  const isScanning = loading || scanProgress.status === 'running';
+  // 审计日志多维筛选
+  const filteredAuditLogs = auditLogs.filter((log) => {
+    if (auditFilterAction !== 'all' && log.action !== auditFilterAction) {
+      return false;
+    }
+    if (auditSearchText.trim()) {
+      const q = auditSearchText.trim().toLowerCase();
+      const op = String(log.operatorName || log.operatorId || '').toLowerCase();
+      const p = JSON.stringify(log.params || {}).toLowerCase();
+      const r = JSON.stringify(log.result || {}).toLowerCase();
+      if (!op.includes(q) && !p.includes(q) && !r.includes(q)) {
+        return false;
+      }
+    }
+    return true;
+  });
+
+  const isScanning = scanProgress.status === 'running';
 
   const tabItems = [
     {
@@ -735,7 +1170,6 @@ export const AttachmentCleanerPage: React.FC = () => {
             rowKey="id"
             columns={columns}
             dataSource={allActiveItems}
-            loading={isScanning && items.length === 0}
             rowSelection={{
               selectedRowKeys,
               onChange: (keys) => setSelectedRowKeys(keys),
@@ -763,7 +1197,6 @@ export const AttachmentCleanerPage: React.FC = () => {
             rowKey="id"
             columns={columns}
             dataSource={unusedItems}
-            loading={isScanning && items.length === 0}
             rowSelection={{
               selectedRowKeys,
               onChange: (keys) => setSelectedRowKeys(keys),
@@ -802,7 +1235,6 @@ export const AttachmentCleanerPage: React.FC = () => {
             rowKey="id"
             columns={columns}
             dataSource={duplicateItems}
-            loading={isScanning && items.length === 0}
             rowSelection={{
               selectedRowKeys,
               onChange: (keys) => setSelectedRowKeys(keys),
@@ -834,7 +1266,6 @@ export const AttachmentCleanerPage: React.FC = () => {
             rowKey="id"
             columns={columns}
             dataSource={recycledItems}
-            loading={isScanning && items.length === 0}
             rowSelection={{
               selectedRowKeys,
               onChange: (keys) => setSelectedRowKeys(keys),
@@ -848,22 +1279,50 @@ export const AttachmentCleanerPage: React.FC = () => {
       label: `操作审计 (${auditLogs.length})`,
       children: (
         <div>
-          <div style={{ marginBottom: 16 }}>
-            <Space>
+          <div style={{ marginBottom: 16, display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 12 }}>
+            <Space wrap>
               <Button icon={<SyncOutlined />} loading={auditLoading} onClick={fetchAuditLogs}>
                 刷新
               </Button>
-              <Button danger disabled={auditLogs.length === 0} onClick={handleClearAuditLogs}>
-                清空日志
-              </Button>
+              <Select
+                value={auditFilterAction}
+                onChange={(val) => setAuditFilterAction(val)}
+                style={{ width: 160 }}
+                options={[
+                  { label: '全部操作动作', value: 'all' },
+                  { label: '移入回收站', value: 'recycle' },
+                  { label: '还原', value: 'restore' },
+                  { label: '彻底物理删除', value: 'purge' },
+                  { label: '重复文件去重', value: 'deduplicate' },
+                  { label: '文件覆盖替换', value: 'replaceFile' },
+                  { label: '引用迁移替换', value: 'replaceReference' },
+                  { label: '修改配置', value: 'updateSettings' },
+                  { label: '自动定时清理', value: 'autoCleanExpired' },
+                ]}
+              />
+              <Input
+                placeholder="搜索操作人、文件名或关键词"
+                prefix={<SearchOutlined style={{ color: '#bfbfbf' }} />}
+                value={auditSearchText}
+                onChange={(e) => setAuditSearchText(e.target.value)}
+                allowClear
+                style={{ width: 240 }}
+              />
+              <span style={{ color: '#888', fontSize: 13 }}>
+                已显示 <strong>{filteredAuditLogs.length}</strong> / {auditLogs.length} 条记录
+              </span>
             </Space>
+
+            <Button danger disabled={auditLogs.length === 0} onClick={handleClearAuditLogs}>
+              清空日志
+            </Button>
           </div>
           <Table
             rowKey="id"
             columns={auditColumns}
-            dataSource={auditLogs}
-            pagination={{ pageSize: 20 }}
-            locale={{ emptyText: '暂无审计记录' }}
+            dataSource={filteredAuditLogs}
+            pagination={{ pageSize: 15, showSizeChanger: true, pageSizeOptions: ['15', '30', '50', '100'] }}
+            locale={{ emptyText: '暂无符合条件的审计记录' }}
           />
         </div>
       ),
@@ -929,35 +1388,125 @@ export const AttachmentCleanerPage: React.FC = () => {
         </Col>
       </Row>
 
-      {/* 实时全盘扫描进度条展示 */}
-      {isScanning && (
+      {/* 扫描断点恢复警示条 */}
+      {!isScanning && checkpoint && (
+        <Alert
+          style={{ marginBottom: 16 }}
+          message="检测到未完成的扫描断点"
+          description={
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: 4 }}>
+              <span>
+                系统记录到上次扫描在 <strong>[{checkpoint.phaseText || '处理中'}]</strong> 暂停或中断，已完成进度 <strong>{checkpoint.percent || 0}%</strong>。
+                您可以直接从断点继续，未修改的附件将自动命中缓存秒级跳过。
+              </span>
+              <Space>
+                <Button
+                  type="primary"
+                  size="small"
+                  icon={<PlayCircleOutlined />}
+                  style={{ background: '#52c41a', borderColor: '#52c41a' }}
+                  onClick={() => startScan(true)}
+                >
+                  继续后台续扫
+                </Button>
+                <Button size="small" danger onClick={handleCancelScan}>
+                  放弃断点
+                </Button>
+              </Space>
+            </div>
+          }
+          type="warning"
+          showIcon
+        />
+      )}
+
+      {/* 后台异步扫描状态卡片（完全非阻塞，支持最小化折叠） */}
+      {(isScanning || scanProgress.status === 'paused') && (
         <Card
+          size="small"
           style={{
             marginBottom: 16,
-            borderColor: '#1890ff',
-            background: 'linear-gradient(135deg, #f0f7ff 0%, #ffffff 100%)',
+            borderColor: scanProgress.status === 'paused' ? '#faad14' : '#52c41a',
+            background:
+              scanProgress.status === 'paused'
+                ? 'linear-gradient(135deg, #fffbe6 0%, #ffffff 100%)'
+                : 'linear-gradient(135deg, #f6ffed 0%, #ffffff 100%)',
           }}
         >
-          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
             <Space>
-              <LoadingOutlined style={{ color: '#1890ff', fontSize: 16 }} spin />
-              <span style={{ fontWeight: 600, color: '#1890ff', fontSize: 14 }}>
-                全盘深度扫描进行中...
-              </span>
-              <Tag color="blue">{scanProgress.phaseText || '正在处理'}</Tag>
+              {isScanning ? (
+                <Badge status="processing" color="#52c41a" text={<strong style={{ color: '#389e0d' }}>后台静默扫描运行中</strong>} />
+              ) : (
+                <Badge status="warning" text={<strong style={{ color: '#d46b08' }}>后台扫描已暂停</strong>} />
+              )}
+              <Tag color={scanProgress.status === 'paused' ? 'orange' : 'green'}>
+                {scanProgress.phaseText || '正在后台处理'}
+              </Tag>
+              <Tag icon={<ThunderboltOutlined />} color="cyan">
+                复合智能缓存加速
+              </Tag>
+              {isScanning && (
+                <span style={{ color: '#888', fontSize: 12 }}>
+                  已在后台运行: <strong>{elapsedTime}</strong> 秒（不影响前台任何操作）
+                </span>
+              )}
             </Space>
-            <span style={{ color: '#666', fontSize: 13 }}>
-              已耗时: <strong>{elapsedTime}</strong> 秒
-            </span>
+
+            <Space>
+              {isScanning ? (
+                <>
+                  <Button size="small" icon={<PauseCircleOutlined />} onClick={handlePauseScan}>
+                    暂停后台任务
+                  </Button>
+                  <Button size="small" danger icon={<CloseCircleOutlined />} onClick={handleCancelScan}>
+                    终止任务
+                  </Button>
+                </>
+              ) : (
+                <>
+                  <Button
+                    type="primary"
+                    size="small"
+                    icon={<PlayCircleOutlined />}
+                    style={{ background: '#52c41a', borderColor: '#52c41a' }}
+                    onClick={() => startScan(true)}
+                  >
+                    继续后台任务
+                  </Button>
+                  <Button size="small" danger icon={<CloseCircleOutlined />} onClick={handleCancelScan}>
+                    终止任务
+                  </Button>
+                </>
+              )}
+              <Button
+                size="small"
+                type="text"
+                icon={minimizedProgress ? <DownOutlined /> : <UpOutlined />}
+                onClick={() => setMinimizedProgress(!minimizedProgress)}
+              >
+                {minimizedProgress ? '展开进度' : '收起'}
+              </Button>
+            </Space>
           </div>
-          <Progress
-            percent={scanProgress.percent}
-            status="active"
-            strokeColor={{
-              '0%': '#108ee9',
-              '100%': '#52c41a',
-            }}
-          />
+
+          {!minimizedProgress && (
+            <div style={{ marginTop: 8 }}>
+              <Progress
+                percent={scanProgress.percent}
+                size="small"
+                status={scanProgress.status === 'paused' ? 'normal' : 'active'}
+                strokeColor={
+                  scanProgress.status === 'paused'
+                    ? '#faad14'
+                    : {
+                        '0%': '#108ee9',
+                        '100%': '#52c41a',
+                      }
+                }
+              />
+            </div>
+          )}
         </Card>
       )}
 
@@ -967,7 +1516,7 @@ export const AttachmentCleanerPage: React.FC = () => {
             <span>附件清理与维护面板</span>
             {lastScannedAt && (
               <Tag icon={<ClockCircleOutlined />} color="default">
-                最近扫描时间: {lastScannedAt}
+                最近扫描快照: {lastScannedAt}
               </Tag>
             )}
           </Space>
@@ -976,11 +1525,10 @@ export const AttachmentCleanerPage: React.FC = () => {
           <Space>
             <Button
               icon={<SyncOutlined spin={isScanning} />}
-              loading={isScanning}
-              type={isScanning ? 'primary' : 'default'}
-              onClick={startScan}
+              type={isScanning ? 'dashed' : 'default'}
+              onClick={() => startScan(false)}
             >
-              {isScanning ? '正在全盘扫描' : '重新全盘扫描'}
+              {isScanning ? '后台扫描运行中...' : '启动后台全盘扫描'}
             </Button>
             <Button
               icon={<SettingOutlined />}
@@ -997,6 +1545,142 @@ export const AttachmentCleanerPage: React.FC = () => {
       >
         <Tabs defaultActiveKey="all" items={tabItems} />
       </Card>
+
+      {/* 文件替换弹窗 */}
+      <Modal
+        title={
+          <Space>
+            <SwapOutlined style={{ color: '#1890ff' }} />
+            <span>附件文件替换与版本更新</span>
+          </Space>
+        }
+        open={replaceModalOpen}
+        onCancel={() => {
+          setReplaceModalOpen(false);
+          setReplaceUploadFile(null);
+          setReplaceTargetId(undefined);
+        }}
+        footer={[
+          <Button
+            key="cancel"
+            onClick={() => {
+              setReplaceModalOpen(false);
+              setReplaceUploadFile(null);
+              setReplaceTargetId(undefined);
+            }}
+          >
+            取消
+          </Button>,
+          <Button
+            key="submit"
+            type="primary"
+            loading={replaceSubmitting}
+            disabled={replaceMode === 'upload' ? !replaceUploadFile : !replaceTargetId}
+            onClick={handleExecuteReplace}
+          >
+            {replaceMode === 'upload' ? '确认覆盖替换' : '确认迁移引用'}
+          </Button>,
+        ]}
+        width={640}
+      >
+        {currentReplaceRecord && (
+          <div>
+            <Alert
+              style={{ marginBottom: 16 }}
+              message="当前待替换的目标附件"
+              description={
+                <div style={{ marginTop: 4 }}>
+                  <p style={{ margin: '2px 0' }}>
+                    <strong>原文件名:</strong> {currentReplaceRecord.title || currentReplaceRecord.filename}
+                  </p>
+                  <p style={{ margin: '2px 0', color: '#666' }}>
+                    <strong>附件 ID:</strong> {currentReplaceRecord.id} | <strong>原大小:</strong>{' '}
+                    {formatSize(currentReplaceRecord.size)} | <strong>存储空间:</strong>{' '}
+                    {currentReplaceRecord.storageName || '默认存储'}
+                  </p>
+                  {currentReplaceRecord.isMissingFile && (
+                    <Tag color="magenta" style={{ marginTop: 4 }}>
+                      物理磁盘文件已丢失（可通过上传新文件原地修复）
+                    </Tag>
+                  )}
+                </div>
+              }
+              type="info"
+              showIcon
+            />
+
+            <Tabs
+              activeKey={replaceMode}
+              onChange={(k) => setReplaceMode(k as any)}
+              items={[
+                {
+                  key: 'upload',
+                  label: '上传新文件覆盖（推荐：保持原 ID 与引用不变）',
+                  children: (
+                    <div style={{ padding: '8px 0' }}>
+                      <p style={{ color: '#666', fontSize: 13, marginBottom: 12 }}>
+                        上传新的物理文件覆盖当前附件记录，<strong>保持原有附件 ID 和所有数据表引用关系不变</strong>。适用于升级合同/图片/文档模板版本，或修复 404 缺失附件。
+                      </p>
+                      <Upload.Dragger
+                        maxCount={1}
+                        beforeUpload={(file) => {
+                          setReplaceUploadFile(file);
+                          return false;
+                        }}
+                        onRemove={() => setReplaceUploadFile(null)}
+                        fileList={replaceUploadFile ? [replaceUploadFile as any] : []}
+                      >
+                        <p className="ant-upload-drag-icon">
+                          <InboxOutlined style={{ fontSize: 36, color: '#1890ff' }} />
+                        </p>
+                        <p className="ant-upload-text">点击或将新文件拖拽到此区域</p>
+                        <p className="ant-upload-hint">支持任意格式文件，覆盖后所有业务引用即时生效</p>
+                      </Upload.Dragger>
+                    </div>
+                  ),
+                },
+                {
+                  key: 'reference',
+                  label: '全局改指向已有附件',
+                  children: (
+                    <div style={{ padding: '8px 0' }}>
+                      <p style={{ color: '#666', fontSize: 13, marginBottom: 12 }}>
+                        将所有引用当前附件的业务数据表记录，<strong>全局批量改指向选中的目标附件</strong>。
+                      </p>
+                      <Form layout="vertical">
+                        <Form.Item label="选择目标替换附件" required>
+                          <Select
+                            showSearch
+                            placeholder="输入文件名或 ID 搜索目标附件..."
+                            filterOption={(input, option) =>
+                              String(option?.label || '').toLowerCase().includes(input.toLowerCase())
+                            }
+                            value={replaceTargetId}
+                            onChange={(val) => setReplaceTargetId(val)}
+                            options={items
+                              .filter((item) => String(item.id) !== String(currentReplaceRecord.id) && !item.isRecycled)
+                              .map((item) => ({
+                                value: item.id,
+                                label: `${item.title || item.filename} (ID: ${item.id}, ${formatSize(item.size)})`,
+                              }))}
+                          />
+                        </Form.Item>
+                        <Form.Item>
+                          <Switch
+                            checked={recycleSourceAtt}
+                            onChange={(checked) => setRecycleSourceAtt(checked)}
+                          />
+                          <span style={{ marginLeft: 8 }}>替换完成后将当前原附件移入回收站</span>
+                        </Form.Item>
+                      </Form>
+                    </div>
+                  ),
+                },
+              ]}
+            />
+          </div>
+        )}
+      </Modal>
 
       <Modal
         title="回收站与定时扫描策略配置"
@@ -1198,6 +1882,112 @@ export const AttachmentCleanerPage: React.FC = () => {
           </Modal>
         )
       )}
+
+      {/* 审计日志详情抽屉 */}
+      <Drawer
+        title={
+          <Space>
+            <InfoCircleOutlined style={{ color: '#1890ff' }} />
+            <span>操作审计详情</span>
+            {currentAuditLog && (
+              <Tag color={auditActionMeta[currentAuditLog.action]?.color}>
+                {auditActionMeta[currentAuditLog.action]?.label || currentAuditLog.action}
+              </Tag>
+            )}
+          </Space>
+        }
+        placement="right"
+        width={620}
+        open={auditDrawerOpen}
+        onClose={() => {
+          setAuditDrawerOpen(false);
+          setCurrentAuditLog(null);
+        }}
+      >
+        {currentAuditLog && (
+          <div>
+            <Descriptions title="基本信息" bordered size="small" column={1} style={{ marginBottom: 20 }}>
+              <Descriptions.Item label="操作时间">
+                {currentAuditLog.createdAt ? new Date(currentAuditLog.createdAt).toLocaleString() : '-'}
+              </Descriptions.Item>
+              <Descriptions.Item label="操作用户">
+                <strong>{currentAuditLog.operatorName || currentAuditLog.operatorId || '系统内置'}</strong>
+                {currentAuditLog.operatorId && (
+                  <span style={{ color: '#888', marginLeft: 8 }}>(ID: {currentAuditLog.operatorId})</span>
+                )}
+              </Descriptions.Item>
+              {currentAuditLog.ip && (
+                <Descriptions.Item label="客户端 IP">{currentAuditLog.ip}</Descriptions.Item>
+              )}
+              <Descriptions.Item label="动作类型">
+                <Tag color={auditActionMeta[currentAuditLog.action]?.color}>
+                  {auditActionMeta[currentAuditLog.action]?.label || currentAuditLog.action}
+                </Tag>
+              </Descriptions.Item>
+            </Descriptions>
+
+            <div style={{ marginBottom: 20 }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
+                <span style={{ fontWeight: 600, fontSize: 14 }}>请求参数 (Params)</span>
+                <Button
+                  size="small"
+                  icon={<CopyOutlined />}
+                  onClick={() => {
+                    navigator.clipboard.writeText(JSON.stringify(currentAuditLog.params, null, 2));
+                    message.success('参数 JSON 已复制到剪贴板');
+                  }}
+                >
+                  复制 JSON
+                </Button>
+              </div>
+              <pre
+                style={{
+                  background: '#1e1e1e',
+                  color: '#9cdcfe',
+                  padding: 12,
+                  borderRadius: 6,
+                  fontSize: 12,
+                  maxHeight: 220,
+                  overflow: 'auto',
+                  fontFamily: 'Consolas, Monaco, monospace',
+                }}
+              >
+                {JSON.stringify(currentAuditLog.params || {}, null, 2)}
+              </pre>
+            </div>
+
+            <div>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
+                <span style={{ fontWeight: 600, fontSize: 14 }}>执行结果 (Result)</span>
+                <Button
+                  size="small"
+                  icon={<CopyOutlined />}
+                  onClick={() => {
+                    navigator.clipboard.writeText(JSON.stringify(currentAuditLog.result, null, 2));
+                    message.success('结果 JSON 已复制到剪贴板');
+                  }}
+                >
+                  复制 JSON
+                </Button>
+              </div>
+              <pre
+                style={{
+                  background: '#1e1e1e',
+                  color: '#6a9955',
+                  padding: 12,
+                  borderRadius: 6,
+                  fontSize: 12,
+                  maxHeight: 260,
+                  overflow: 'auto',
+                  fontFamily: 'Consolas, Monaco, monospace',
+                }}
+              >
+                {JSON.stringify(currentAuditLog.result || {}, null, 2)}
+              </pre>
+            </div>
+          </div>
+        )}
+      </Drawer>
     </div>
   );
 };

@@ -7,6 +7,7 @@
  * For more information, please refer to: https://www.nocobase.com/agreement.
  */
 
+import path from 'path';
 import { Context } from '@nocobase/actions';
 import { AuditOperator } from '../services/AttachmentCleanerService';
 import PluginAttachmentCleanerServer from '../plugin';
@@ -28,7 +29,20 @@ export function registerCleanerActions(plugin: PluginAttachmentCleanerServer) {
       },
 
       async startScan(ctx: Context, next: () => Promise<void>) {
-        const result = await plugin.cleanerService.startScan(true);
+        const { resume } = ctx.action.params?.values || ctx.request.body || {};
+        const result = await plugin.cleanerService.startScan(true, Boolean(resume));
+        ctx.body = result;
+        await next();
+      },
+
+      async pauseScan(ctx: Context, next: () => Promise<void>) {
+        const result = await plugin.cleanerService.pauseScan();
+        ctx.body = result;
+        await next();
+      },
+
+      async cancelScan(ctx: Context, next: () => Promise<void>) {
+        const result = await plugin.cleanerService.cancelScan();
         ctx.body = result;
         await next();
       },
@@ -108,6 +122,93 @@ export function registerCleanerActions(plugin: PluginAttachmentCleanerServer) {
 
       async clearAuditLogs(ctx: Context, next: () => Promise<void>) {
         const result = await plugin.cleanerService.clearAuditLogs();
+        ctx.body = result;
+        await next();
+      },
+
+      async replaceFile(ctx: Context, next: () => Promise<void>) {
+        const values = ctx.action.params?.values || ctx.request.body || {};
+        const { attachmentId, fileBase64, originalFilename, mimetype, size } = values;
+
+        if (!attachmentId) {
+          ctx.throw(400, 'attachmentId is required');
+        }
+
+        let buffer: Buffer | undefined;
+        let tempFilePath: string | undefined;
+
+        // 1. 优先从 multipart files 中提取
+        const fileObj =
+          (ctx.request as any).files?.file ||
+          (ctx.req as any).file ||
+          (ctx.request as any).files?.upload ||
+          (ctx.request as any).file;
+
+        if (fileObj) {
+          tempFilePath = fileObj.path || fileObj.filepath;
+          if (!tempFilePath && fileObj.buffer) {
+            buffer = fileObj.buffer;
+          }
+        } else if (fileBase64) {
+          // 2. Base64 方式
+          const base64Data = String(fileBase64).replace(/^data:.*?;base64,/, '');
+          buffer = Buffer.from(base64Data, 'base64');
+        }
+
+        if (!buffer && !tempFilePath) {
+          ctx.throw(400, '请选择需要上传替换的文件');
+        }
+
+        const result = await plugin.cleanerService.replaceFile(
+          attachmentId,
+          {
+            originalFilename: originalFilename || fileObj?.name || fileObj?.originalFilename,
+            mimetype: mimetype || fileObj?.type || fileObj?.mimetype,
+            size: size || (buffer ? buffer.length : fileObj?.size || 0),
+            buffer,
+            tempFilePath,
+          },
+          getOperator(ctx),
+        );
+
+        ctx.body = result;
+        await next();
+      },
+
+      async replaceReference(ctx: Context, next: () => Promise<void>) {
+        const { sourceAttachmentId, targetAttachmentId, recycleSource } =
+          ctx.action.params?.values || ctx.request.body || {};
+
+        if (!sourceAttachmentId || !targetAttachmentId) {
+          ctx.throw(400, 'sourceAttachmentId and targetAttachmentId are required');
+        }
+
+        const result = await plugin.cleanerService.replaceReference(
+          sourceAttachmentId,
+          targetAttachmentId,
+          recycleSource !== false,
+          getOperator(ctx),
+        );
+
+        ctx.body = result;
+        await next();
+      },
+
+      async replaceWithAttachment(ctx: Context, next: () => Promise<void>) {
+        const { oldAttachmentId, newAttachmentId, mode } =
+          ctx.action.params?.values || ctx.request.body || {};
+
+        if (!oldAttachmentId || !newAttachmentId) {
+          ctx.throw(400, 'oldAttachmentId and newAttachmentId are required');
+        }
+
+        const result = await plugin.cleanerService.replaceWithAttachment(
+          oldAttachmentId,
+          newAttachmentId,
+          mode || 'overwrite',
+          getOperator(ctx),
+        );
+
         ctx.body = result;
         await next();
       },

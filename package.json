@@ -6,7 +6,7 @@
   "description.zh-CN": "扫描、分析并清理 NocoBase 中的未引用孤立附件或过期附件。",
   "homepage": "https://github.com/STlxx-lin/plugin-attachment-cleaner",
   "homepage.zh-CN": "https://github.com/STlxx-lin/plugin-attachment-cleaner",
-  "version": "0.0.5",
+  "version": "0.0.13",
   "main": "server.js",
   "client": "client.js",
   "nocobase": {

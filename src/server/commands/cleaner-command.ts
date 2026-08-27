@@ -63,8 +63,8 @@ export function registerCleanerCommands(app: Application) {
       }
 
       console.log('执行回收站过期附件自动物理清理...');
-      const result = await plugin.cleanerService.autoCleanExpired();
-      console.log(`自动清理完成。共擦除物理附件: ${result.purgedCount || 0} 个`);
+      const result: any = await plugin.cleanerService.autoCleanExpired();
+      console.log(`自动清理完成。共擦除物理附件: ${result?.count || 0} 个`);
     });
 
   app
@@ -81,8 +81,8 @@ export function registerCleanerCommands(app: Application) {
       }
 
       console.log('开始对重复文件去重...');
-      const result = await plugin.cleanerService.deduplicate();
-      console.log(`去重完成：处理 ${result.groups} 组，保留 ${result.keptCount} 个，`);
-      console.log(`移除 ${result.removedCount} 个附件，更新 ${result.referencesUpdated} 处引用（${result.recordsUpdated} 条记录）。`);
+      const result: any = await plugin.cleanerService.deduplicate();
+      console.log(`去重完成：处理 ${result?.groups || 0} 组，保留 ${result?.keptCount || 0} 个，`);
+      console.log(`移除 ${result?.removedCount || 0} 个附件，更新 ${result?.referencesUpdated || 0} 处引用。`);
     });
 }
