@@ -98,6 +98,9 @@ export class AttachmentCleanerService {
   /**
    * 从数据库加载文件指纹缓存
    */
+  /**
+   * 从数据库加载文件指纹缓存
+   */
   private async loadFingerprintCache() {
     try {
       const settingsRepo = this.db.getRepository('attachmentCleanerSettings');
@@ -124,7 +127,7 @@ export class AttachmentCleanerService {
   }
 
   /**
-   * 持久化文件指纹缓存到数据库
+   * 持久化文件指纹缓存到数据库（最多保留最新 3000 条，防止单行 JSON 爆炸）
    */
   private async persistFingerprintCache() {
     if (!this.cacheDirty) return;
@@ -134,20 +137,31 @@ export class AttachmentCleanerService {
 
       const cacheList: any[] = [];
       for (const [id, entry] of this.cacheMap.entries()) {
-        cacheList.push({ id, ...entry });
+        cacheList.push({
+          id,
+          size: entry.size,
+          updatedAt: entry.updatedAt,
+          path: entry.path,
+          fileHash: entry.fileHash,
+          isMissingFile: entry.isMissingFile,
+          cachedAt: entry.cachedAt,
+        });
       }
+
+      // 截取最新 3000 条
+      const trimmedList = cacheList.slice(-3000);
 
       const record = await settingsRepo.findOne({ filter: { key: 'fingerprintCache' } });
       if (record) {
         await settingsRepo.update({
           filter: { key: 'fingerprintCache' },
-          values: { value: cacheList },
+          values: { value: trimmedList },
         });
       } else {
         await settingsRepo.create({
           values: {
             key: 'fingerprintCache',
-            value: cacheList,
+            value: trimmedList,
           },
         });
       }
@@ -156,16 +170,46 @@ export class AttachmentCleanerService {
   }
 
   /**
-   * 保存最近一次全盘扫描快照到设置集合中
+   * 保存最近一次全盘扫描快照到设置集合中（精简字段存储）
    */
   async saveScanSnapshot(result: any, completedAt: number) {
     try {
       const settingsRepo = this.db.getRepository('attachmentCleanerSettings');
       if (settingsRepo) {
         const current = await this.getSettings();
+
+        // 精简快照项，去除多余嵌套属性
+        let leanResult = result;
+        if (result && Array.isArray(result.items)) {
+          leanResult = {
+            stats: result.stats,
+            items: result.items.map((item: any) => ({
+              id: item.id,
+              title: item.title,
+              filename: item.filename,
+              extname: item.extname,
+              size: item.size,
+              mimetype: item.mimetype,
+              url: item.url,
+              storageId: item.storageId,
+              storageName: item.storageName,
+              storageType: item.storageType,
+              createdAt: item.createdAt,
+              updatedAt: item.updatedAt,
+              isUnused: item.isUnused,
+              isDuplicate: item.isDuplicate,
+              duplicateGroupId: item.duplicateGroupId,
+              duplicateCount: item.duplicateCount,
+              isRecycled: item.isRecycled,
+              recycledAt: item.recycledAt,
+              isMissingFile: item.isMissingFile,
+            })),
+          };
+        }
+
         const updated = {
           ...current,
-          lastScanResult: result,
+          lastScanResult: leanResult,
           lastScannedAt: new Date(completedAt).toISOString(),
           scanCheckpoint: null, // 完成后清空断点
         };
@@ -541,7 +585,19 @@ export class AttachmentCleanerService {
     const recycledRecords = recycleRepo ? await recycleRepo.find() : [];
     const recycledSet = new Set(recycledRecords.map((r) => r.get('attachmentId')));
 
-    const allAttachments = await attachmentsRepo.find({ sort: ['-createdAt'] });
+    const allAttachments: any[] = [];
+    let page = 0;
+    while (true) {
+      const batch = await attachmentsRepo.find({
+        sort: ['-createdAt'],
+        limit: 300,
+        offset: page * 300,
+      });
+      if (!batch || batch.length === 0) break;
+      allAttachments.push(...batch);
+      if (batch.length < 300) break;
+      page++;
+    }
     const activeAttachments = allAttachments.filter((att) => !recycledSet.has(att.get('id')));
 
     const duplicateGroups = await this.analyzer.findDuplicateGroups(activeAttachments, {

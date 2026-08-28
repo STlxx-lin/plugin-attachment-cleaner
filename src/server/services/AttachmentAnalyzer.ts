@@ -97,6 +97,9 @@ export class ScanPausedError extends Error {
   }
 }
 
+/** 主动让出 Node.js 主线程事件循环，防止长时间任务造成服务假死 */
+export const yieldToEventLoop = () => new Promise<void>((resolve) => setImmediate(resolve));
+
 /** 仅排除清理插件自身和系统底层迁移表（系统Logo、设置、UI Schemas、用户头像等均需正常扫描） */
 const SYSTEM_EXCLUDE_COLLECTIONS = new Set([
   'attachments',
@@ -105,6 +108,8 @@ const SYSTEM_EXCLUDE_COLLECTIONS = new Set([
   'attachmentCleanerAuditLogs',
   'migrations',
 ]);
+
+const BATCH_SIZE = 300;
 
 export class AttachmentAnalyzer {
   constructor(private app: Application) {}
@@ -142,39 +147,48 @@ export class AttachmentAnalyzer {
   }
 
   /**
-   * 预先构建物理磁盘文件索引 Set（将物理文件快速载入内存，0ms 内存比对，杜绝数十万次同步 fs.existsSync）
+   * 异步非阻塞检测物理磁盘文件是否存在（精准按需探测 + 内存缓存，彻底替代同步全盘递归）
    */
-  private buildPhysicalDiskSet(docRoots: string[]): Set<string> {
-    const fileSet = new Set<string>();
+  private async checkPhysicalFileExists(
+    filename: string,
+    recPath: string,
+    docRoots: string[],
+    diskCache: Map<string, boolean>,
+  ): Promise<boolean> {
+    if (!filename) return false;
+    const normalizedRec = (recPath || '').replace(/\\/g, '/').replace(/^\//, '');
+    const relKey = normalizedRec ? `${normalizedRec}/${filename}` : filename;
 
-    const scanDir = (dir: string, baseDir: string) => {
-      try {
-        if (!fs.existsSync(dir)) return;
-        const entries = fs.readdirSync(dir, { withFileTypes: true });
-        for (const entry of entries) {
-          const fullPath = path.join(dir, entry.name);
-          if (entry.isDirectory()) {
-            scanDir(fullPath, baseDir);
-          } else {
-            fileSet.add(entry.name);
-            const rel = path.relative(baseDir, fullPath).replace(/\\/g, '/');
-            fileSet.add(rel);
-            fileSet.add(path.normalize(fullPath));
-          }
-        }
-      } catch (e) {}
-    };
+    if (diskCache.has(relKey)) {
+      return diskCache.get(relKey)!;
+    }
 
     for (const root of docRoots) {
       const absRoot = path.isAbsolute(root) ? root : path.resolve(process.cwd(), root);
-      scanDir(absRoot, absRoot);
+      const candidatePath1 = path.join(absRoot, relKey);
+      const candidatePath2 = path.join(absRoot, filename);
+
+      try {
+        await fs.promises.access(candidatePath1);
+        diskCache.set(relKey, true);
+        return true;
+      } catch {
+        try {
+          await fs.promises.access(candidatePath2);
+          diskCache.set(relKey, true);
+          return true;
+        } catch {
+          // 继续检查下一个 root
+        }
+      }
     }
 
-    return fileSet;
+    diskCache.set(relKey, false);
+    return false;
   }
 
   /**
-   * 扫描系统级设置、Logo、UI Schemas 与用户头像等系统全局引用
+   * 扫描系统级设置、Logo、UI Schemas 与用户头像等系统全局引用（流式分批 + 事件循环让渡）
    */
   async scanSystemSettingsAndUiSchemas(
     allAttachments: any[],
@@ -239,33 +253,61 @@ export class AttachmentAnalyzer {
       }
     } catch (e) {}
 
-    // 2. 扫描 uiSchemas (页面设计器中的自定义块、Logo 图标、插图)
+    await yieldToEventLoop();
+
+    // 2. 扫描 uiSchemas (分批拉取，防止一次性拉取上万条 schema 爆内存)
     try {
       const uiSchemasRepo = this.db.getRepository('uiSchemas');
       if (uiSchemasRepo) {
-        const records = await uiSchemasRepo.find({
-          fields: ['schema'],
-        });
-        for (const record of records) {
-          extractFromValue(record.get('schema'));
+        let page = 0;
+        while (true) {
+          const records = await uiSchemasRepo.find({
+            fields: ['schema'],
+            limit: BATCH_SIZE,
+            offset: page * BATCH_SIZE,
+          });
+
+          if (!records || records.length === 0) break;
+
+          for (const record of records) {
+            extractFromValue(record.get('schema'));
+          }
+
+          if (records.length < BATCH_SIZE) break;
+          page++;
+          await yieldToEventLoop();
         }
       }
     } catch (e) {}
 
-    // 3. 扫描 users (用户头像等)
+    await yieldToEventLoop();
+
+    // 3. 扫描 users (用户头像等，分批查询)
     try {
       const usersRepo = this.db.getRepository('users');
       if (usersRepo) {
-        const records = await usersRepo.find();
-        for (const record of records) {
-          extractFromValue(record.toJSON ? record.toJSON() : record);
+        let page = 0;
+        while (true) {
+          const records = await usersRepo.find({
+            limit: BATCH_SIZE,
+            offset: page * BATCH_SIZE,
+          });
+          if (!records || records.length === 0) break;
+
+          for (const record of records) {
+            extractFromValue(record.toJSON ? record.toJSON() : record);
+          }
+
+          if (records.length < BATCH_SIZE) break;
+          page++;
+          await yieldToEventLoop();
         }
       }
     } catch (e) {}
   }
 
   /**
-   * 扫描所有集合中通过关联字段引用的附件 ID（字段投影瘦身）
+   * 扫描所有集合中通过关联字段引用的附件 ID（分批查询 + 字段投影瘦身 + 事件循环让渡）
    */
   async findUsedAttachmentIds(
     allAttachments?: any[],
@@ -311,35 +353,47 @@ export class AttachmentAnalyzer {
         try {
           const repo = this.db.getRepository(collection.name);
           if (repo) {
-            // 字段瘦身投影：仅加载必要的附件关系字段，速度提升 5~10 倍
-            const records = await repo.find({
-              fields: ['id', ...attachmentFields.map((f) => f.name)],
-              appends: attachmentFields.map((f) => f.name),
-            });
+            let page = 0;
+            while (true) {
+              const records = await repo.find({
+                fields: ['id', ...attachmentFields.map((f) => f.name)],
+                appends: attachmentFields.map((f) => f.name),
+                limit: BATCH_SIZE,
+                offset: page * BATCH_SIZE,
+              });
 
-            for (const record of records) {
-              for (const field of attachmentFields) {
-                const val = record.get(field.name);
-                if (!val) continue;
+              if (!records || records.length === 0) break;
 
-                if (Array.isArray(val)) {
-                  for (const item of val) {
-                    if (typeof item === 'object' && item?.id) {
-                      usedIds.add(item.id);
-                    } else if (typeof item === 'number' || typeof item === 'string') {
-                      usedIds.add(item);
+              for (const record of records) {
+                for (const field of attachmentFields) {
+                  const val = record.get(field.name);
+                  if (!val) continue;
+
+                  if (Array.isArray(val)) {
+                    for (const item of val) {
+                      if (typeof item === 'object' && item?.id) {
+                        usedIds.add(item.id);
+                      } else if (typeof item === 'number' || typeof item === 'string') {
+                        usedIds.add(item);
+                      }
                     }
+                  } else if (typeof val === 'object' && val?.id) {
+                    usedIds.add(val.id);
+                  } else if (typeof val === 'number' || typeof val === 'string') {
+                    usedIds.add(val);
                   }
-                } else if (typeof val === 'object' && val?.id) {
-                  usedIds.add(val.id);
-                } else if (typeof val === 'number' || typeof val === 'string') {
-                  usedIds.add(val);
                 }
               }
+
+              if (records.length < BATCH_SIZE) break;
+              page++;
+              await yieldToEventLoop();
             }
           }
         } catch (e) {}
       }
+
+      await yieldToEventLoop();
 
       if (options?.onCheckpoint && (i % 5 === 0 || i === collections.length - 1)) {
         await options.onCheckpoint(i + 1, usedIds);
@@ -350,7 +404,7 @@ export class AttachmentAnalyzer {
   }
 
   /**
-   * 扫描富文本 / 长文本字段中可能嵌入的附件（SQL 特征模糊预过滤 + 字段投影）
+   * 扫描富文本 / 长文本字段中可能嵌入的附件（分批查询 + 字段投影 + 事件循环让渡）
    */
   async scanTextReferences(
     allAttachments: any[],
@@ -405,62 +459,76 @@ export class AttachmentAnalyzer {
         const repo = this.db.getRepository(collection.name);
         if (!repo) continue;
 
-        // 构造 SQL 级特征预过滤
         const orConditions: any[] = [];
         for (const f of textFields) {
           orConditions.push({ [f.name]: { $like: '%/api/attachments/%' } });
           orConditions.push({ [f.name]: { $like: '%.%' } });
         }
 
-        let records: any[] = [];
-        try {
-          records = await repo.find({
-            fields: ['id', ...textFields.map((f) => f.name)],
-            filter: {
-              $or: orConditions,
-            },
-          });
-        } catch (filterErr) {
-          records = await repo.find({
-            fields: ['id', ...textFields.map((f) => f.name)],
-          });
-        }
+        let page = 0;
+        while (true) {
+          let records: any[] = [];
+          try {
+            records = await repo.find({
+              fields: ['id', ...textFields.map((f) => f.name)],
+              filter: {
+                $or: orConditions,
+              },
+              limit: BATCH_SIZE,
+              offset: page * BATCH_SIZE,
+            });
+          } catch (filterErr) {
+            records = await repo.find({
+              fields: ['id', ...textFields.map((f) => f.name)],
+              limit: BATCH_SIZE,
+              offset: page * BATCH_SIZE,
+            });
+          }
 
-        for (const record of records) {
-          for (const field of textFields) {
-            let val = record.get(field.name);
-            if (!val) continue;
+          if (!records || records.length === 0) break;
 
-            if (typeof val === 'object') {
-              val = JSON.stringify(val);
-            }
-            if (typeof val !== 'string') continue;
+          for (const record of records) {
+            for (const field of textFields) {
+              let val = record.get(field.name);
+              if (!val) continue;
 
-            if (!val.includes('/') && !val.includes('.')) continue;
-
-            const urlRegex = /(?:src|href)=["']([^"']+)["']|(?:\/api\/attachments\/([^\s"'<>]+))|([a-zA-Z0-9_-]+\.[a-zA-Z0-9]+)/gi;
-            let match;
-            while ((match = urlRegex.exec(val)) !== null) {
-              const matchedFile1 = match[1];
-              const matchedFile2 = match[2];
-              const matchedFile3 = match[3];
-
-              if (matchedFile1) {
-                const id = filenameMap.get(matchedFile1) ?? urlMap.get(matchedFile1);
-                if (id !== undefined) usedIds.add(id);
+              if (typeof val === 'object') {
+                val = JSON.stringify(val);
               }
-              if (matchedFile2) {
-                const id = filenameMap.get(matchedFile2) ?? urlMap.get(matchedFile2);
-                if (id !== undefined) usedIds.add(id);
-              }
-              if (matchedFile3 && (matchedFile3.includes('.') || matchedFile3.length > 5)) {
-                const id = filenameMap.get(matchedFile3);
-                if (id !== undefined) usedIds.add(id);
+              if (typeof val !== 'string') continue;
+
+              if (!val.includes('/') && !val.includes('.')) continue;
+
+              const urlRegex = /(?:src|href)=["']([^"']+)["']|(?:\/api\/attachments\/([^\s"'<>]+))|([a-zA-Z0-9_-]+\.[a-zA-Z0-9]+)/gi;
+              let match;
+              while ((match = urlRegex.exec(val)) !== null) {
+                const matchedFile1 = match[1];
+                const matchedFile2 = match[2];
+                const matchedFile3 = match[3];
+
+                if (matchedFile1) {
+                  const id = filenameMap.get(matchedFile1) ?? urlMap.get(matchedFile1);
+                  if (id !== undefined) usedIds.add(id);
+                }
+                if (matchedFile2) {
+                  const id = filenameMap.get(matchedFile2) ?? urlMap.get(matchedFile2);
+                  if (id !== undefined) usedIds.add(id);
+                }
+                if (matchedFile3 && (matchedFile3.includes('.') || matchedFile3.length > 5)) {
+                  const id = filenameMap.get(matchedFile3);
+                  if (id !== undefined) usedIds.add(id);
+                }
               }
             }
           }
+
+          if (records.length < BATCH_SIZE) break;
+          page++;
+          await yieldToEventLoop();
         }
       } catch (e) {}
+
+      await yieldToEventLoop();
 
       if (options?.onCheckpoint && (i % 5 === 0 || i === collections.length - 1)) {
         await options.onCheckpoint(i + 1, usedIds);
@@ -469,7 +537,7 @@ export class AttachmentAnalyzer {
   }
 
   /**
-   * 查找重复附件组（头尾微采样预过滤 + 256KB 分块指纹 + 全量复合智能缓存）
+   * 查找重复附件组（头尾微采样预过滤 + 256KB 分块指纹 + 全量复合智能缓存 + 事件循环调度）
    */
   async findDuplicateGroups(
     attachments: any[],
@@ -622,6 +690,8 @@ export class AttachmentAnalyzer {
           }
           subList.push(att);
         }
+
+        await yieldToEventLoop();
       }
 
       for (const [hash, items] of hashSubGroups.entries()) {
@@ -639,7 +709,7 @@ export class AttachmentAnalyzer {
   }
 
   /**
-   * 扫描所有业务集合中的附件字段，构建「附件 id -> 引用条目」映射。
+   * 扫描所有业务集合中的附件字段，构建「附件 id -> 引用条目」映射（分批流式查询）。
    */
   async findAttachmentReferences(): Promise<Map<string | number, AttachmentReference[]>> {
     const refMap = new Map<string | number, AttachmentReference[]>();
@@ -668,47 +738,60 @@ export class AttachmentAnalyzer {
       try {
         const repo = this.db.getRepository(collection.name);
         if (!repo) continue;
-        const records = await repo.find({
-          fields: ['id', ...fields.map((f) => f.name)],
-          appends: fields.map((f) => f.name),
-        });
 
-        for (const record of records) {
-          const recordId = record.get('id');
-          for (const field of fields) {
-            const val = record.get(field.name);
-            if (!val) continue;
+        let page = 0;
+        while (true) {
+          const records = await repo.find({
+            fields: ['id', ...fields.map((f) => f.name)],
+            appends: fields.map((f) => f.name),
+            limit: BATCH_SIZE,
+            offset: page * BATCH_SIZE,
+          });
 
-            const ref: AttachmentReference = {
-              collection: collection.name,
-              recordId,
-              field: field.name,
-              value: val,
-            };
+          if (!records || records.length === 0) break;
 
-            if (Array.isArray(val)) {
-              for (const item of val) {
-                if (typeof item === 'object' && item?.id) {
-                  addRef(item.id, ref);
-                } else if (typeof item === 'number' || typeof item === 'string') {
-                  addRef(item, ref);
+          for (const record of records) {
+            const recordId = record.get('id');
+            for (const field of fields) {
+              const val = record.get(field.name);
+              if (!val) continue;
+
+              const ref: AttachmentReference = {
+                collection: collection.name,
+                recordId,
+                field: field.name,
+                value: val,
+              };
+
+              if (Array.isArray(val)) {
+                for (const item of val) {
+                  if (typeof item === 'object' && item?.id) {
+                    addRef(item.id, ref);
+                  } else if (typeof item === 'number' || typeof item === 'string') {
+                    addRef(item, ref);
+                  }
                 }
+              } else if (typeof val === 'object' && val?.id) {
+                addRef(val.id, ref);
+              } else if (typeof val === 'number' || typeof val === 'string') {
+                addRef(val, ref);
               }
-            } else if (typeof val === 'object' && val?.id) {
-              addRef(val.id, ref);
-            } else if (typeof val === 'number' || typeof val === 'string') {
-              addRef(val, ref);
             }
           }
+
+          if (records.length < BATCH_SIZE) break;
+          page++;
+          await yieldToEventLoop();
         }
       } catch (e) {}
+      await yieldToEventLoop();
     }
 
     return refMap;
   }
 
   /**
-   * 全盘深度分析与扫描入口（深度保护系统级 Logo 与设置）
+   * 全盘深度分析与扫描入口（异步非阻塞 + 分批事件循环让渡）
    */
   async analyzeAll(options?: AnalyzeOptions): Promise<{
     items: AttachmentAnalysisItem[];
@@ -740,7 +823,24 @@ export class AttachmentAnalyzer {
     const attachmentsRepo = this.db.getRepository('attachments');
     const recycleRepo = this.db.getRepository('attachmentRecycleBin');
 
-    const allAttachments = attachmentsRepo ? await attachmentsRepo.find({ sort: ['-createdAt'] }) : [];
+    // 分批拉取全部附件记录，避免单次查询爆内存
+    const allAttachments: any[] = [];
+    if (attachmentsRepo) {
+      let page = 0;
+      while (true) {
+        const batch = await attachmentsRepo.find({
+          sort: ['-createdAt'],
+          limit: BATCH_SIZE,
+          offset: page * BATCH_SIZE,
+        });
+        if (!batch || batch.length === 0) break;
+        allAttachments.push(...batch);
+        if (batch.length < BATCH_SIZE) break;
+        page++;
+        await yieldToEventLoop();
+      }
+    }
+
     const recycledRecords = recycleRepo ? await recycleRepo.find() : [];
 
     const storageMap = new Map<string | number, { title: string; name: string; type: string; options?: any }>();
@@ -765,8 +865,7 @@ export class AttachmentAnalyzer {
       }
     } catch (e) {}
 
-    // 一次性构建物理磁盘文件索引 Set（0ms 纯内存比对，杜绝几十万次同步 fs.existsSync）
-    const physicalFileSet = this.buildPhysicalDiskSet(docRoots);
+    const diskCache = new Map<string, boolean>();
 
     const recycledMap = new Map<string | number, Date>();
     for (const rec of recycledRecords) {
@@ -950,7 +1049,9 @@ export class AttachmentAnalyzer {
 
     const items: AttachmentAnalysisItem[] = [];
 
-    for (const att of allAttachments) {
+    // 分批处理附件汇总与物理文件检测
+    for (let i = 0; i < allAttachments.length; i++) {
+      const att = allAttachments[i];
       const id = att.get('id');
       const size = Number(att.get('size') || 0);
       const attUpdated = String(att.get('updatedAt') || '');
@@ -974,18 +1075,17 @@ export class AttachmentAnalyzer {
       const storageId = att.get('storageId');
       const storage = storageId !== undefined && storageId !== null ? storageMap.get(storageId) : undefined;
 
-      // 物理文件检测：优先查询复合智能缓存，未命中走 Set 纯内存瞬时探测（0ms）
+      // 物理文件检测：优先查询复合智能缓存，未命中走异步非阻塞按需探测
       let isMissingFile = false;
       const cached = cacheMap.get(id);
       if (cached && cached.size === size && String(cached.updatedAt || '') === attUpdated && typeof cached.isMissingFile === 'boolean') {
         isMissingFile = cached.isMissingFile;
       } else {
         const filename = att.get('filename');
-        const recPath = (att.get('path') || '').replace(/\\/g, '/');
+        const recPath = att.get('path') || '';
         if (storage?.type === 'local' || !storage || (!att.get('url') && filename)) {
           if (filename) {
-            const relKey = recPath ? `${recPath}/${filename}`.replace(/^\//, '') : filename;
-            const exists = physicalFileSet.has(filename) || physicalFileSet.has(relKey);
+            const exists = await this.checkPhysicalFileExists(filename, recPath, docRoots, diskCache);
             if (!exists) {
               isMissingFile = true;
             }
@@ -1032,6 +1132,10 @@ export class AttachmentAnalyzer {
         recycledAt: recycledMap.get(id),
         isMissingFile,
       });
+
+      if (i % 50 === 0) {
+        await yieldToEventLoop();
+      }
     }
 
     if (onProgress) {

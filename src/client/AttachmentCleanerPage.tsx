@@ -241,7 +241,7 @@ export const AttachmentCleanerPage: React.FC = () => {
         } catch (pollErr) {
           // 容忍单次轮询网络抖动
         }
-      }, 500);
+      }, 1500);
     } catch (e: any) {
       stopPolling();
       message.error(e?.message || '启动全盘扫描失败');
@@ -379,7 +379,7 @@ export const AttachmentCleanerPage: React.FC = () => {
                   message.error(curProgress.error || '后台扫描中断失败');
                 }
               } catch (err) {}
-            }, 500);
+            }, 1500);
 
             // 如果有之前留存的快照数据，也可先呈现
             if (payload.hasSnapshot && payload.result) {

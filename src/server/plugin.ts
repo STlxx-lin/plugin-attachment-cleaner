@@ -95,7 +95,7 @@ export class PluginAttachmentCleanerServer extends Plugin {
     await this.cleanerService.updateSettings({
       autoCleanEnabled: true,
       retentionDays: 30,
-      autoScanEnabled: true,
+      autoScanEnabled: false,
       autoScanCron: '0 3 * * *',
     });
   }
