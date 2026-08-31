@@ -59,36 +59,9 @@ export class PluginAttachmentCleanerServer extends Plugin {
   async load() {
     registerCleanerActions(this);
 
-    const appWithCron = this.app as any;
-    if (appWithCron.cron && typeof appWithCron.cron.add === 'function') {
-      // 1. 定时清理回收站过期附件 (每天凌晨 2:00)
-      appWithCron.cron.add('attachment-cleaner-auto-clean', '0 2 * * *', async () => {
-        try {
-          await this.cleanerService.autoCleanExpired();
-        } catch (err) {
-          this.app.logger.error('[attachment-cleaner] auto clean task error:', err);
-        }
-      });
-
-      // 2. 定时自动全盘扫描任务 (根据配置的 Cron 执行，默认每天凌晨 3:00)
-      try {
-        const settings = await this.cleanerService.getSettings();
-        if (settings.autoScanEnabled) {
-          const cronExpr = settings.autoScanCron || '0 3 * * *';
-          appWithCron.cron.add('attachment-cleaner-auto-scan', cronExpr, async () => {
-            try {
-              this.app.logger.info('[attachment-cleaner] starting scheduled scan...');
-              await this.cleanerService.startScan(false);
-              this.app.logger.info('[attachment-cleaner] scheduled scan completed.');
-            } catch (err) {
-              this.app.logger.error('[attachment-cleaner] scheduled scan error:', err);
-            }
-          });
-        }
-      } catch (e) {
-        // ignore initial cron load error
-      }
-    }
+    // 注册定时任务（回收站过期清理 + 可配置的定时全盘扫描）。
+    // 服务内部使用 app.cronJobManager.addJob 实现，并在配置变化时支持热更新。
+    this.cleanerService.registerCronJobs();
   }
 
   async install() {

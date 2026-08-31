@@ -12,6 +12,9 @@ import { Context } from '@nocobase/actions';
 import { AuditOperator } from '../services/AttachmentCleanerService';
 import PluginAttachmentCleanerServer from '../plugin';
 
+/** 直接覆盖附件内容的 base64 体积上限（100MB，base64 编码膨胀约 33% 由客户端负责） */
+const MAX_REPLACE_FILE_SIZE = 100 * 1024 * 1024;
+
 function getOperator(ctx: Context): AuditOperator | undefined {
   const user = ctx.state?.currentUser;
   if (!user) return undefined;
@@ -48,13 +51,25 @@ export function registerCleanerActions(plugin: PluginAttachmentCleanerServer) {
       },
 
       async getScanProgress(ctx: Context, next: () => Promise<void>) {
-        const result = plugin.cleanerService.getScanProgress();
-        ctx.body = result;
+        // 剥离全量扫描结果：条目统一走 getLastScanResult 分页获取，避免轮询响应过大
+        const { result, ...progress } = plugin.cleanerService.getScanProgress();
+        ctx.body = progress;
         await next();
       },
 
       async getLastScanResult(ctx: Context, next: () => Promise<void>) {
-        const result = await plugin.cleanerService.getLastScanResult();
+        const values = (ctx.action.params?.values || {}) as any;
+        // 注意：不能使用名为 filter 的查询参数——NocoBase 会拦截 filter 参数做内建过滤解析，
+        // 导致自定义 action 被绕过并返回空结果。客户端使用 tab 参数，这里兼容读取旧的 filter。
+        const tab = values.tab ?? ctx.request.query?.tab;
+        const filter = tab ?? values.filter ?? ctx.request.query?.filter;
+        const query = {
+          page: values.page ?? ctx.request.query?.page,
+          pageSize: values.pageSize ?? ctx.request.query?.pageSize,
+          filter,
+          search: values.search ?? ctx.request.query?.search,
+        };
+        const result = await plugin.cleanerService.getLastScanResult(query);
         ctx.body = result;
         await next();
       },
@@ -90,7 +105,14 @@ export function registerCleanerActions(plugin: PluginAttachmentCleanerServer) {
       },
 
       async deduplicate(ctx: Context, next: () => Promise<void>) {
-        const result = await plugin.cleanerService.deduplicate(getOperator(ctx));
+        // 后台异步执行：立即返回任务进度，避免大库下请求超时
+        const result = plugin.cleanerService.startDeduplication(getOperator(ctx));
+        ctx.body = result;
+        await next();
+      },
+
+      async getDedupProgress(ctx: Context, next: () => Promise<void>) {
+        const result = plugin.cleanerService.getDedupProgress();
         ctx.body = result;
         await next();
       },
@@ -159,6 +181,11 @@ export function registerCleanerActions(plugin: PluginAttachmentCleanerServer) {
           ctx.throw(400, '请选择需要上传替换的文件');
         }
 
+        const replaceSize = buffer ? buffer.length : Number(size) || 0;
+        if (replaceSize > MAX_REPLACE_FILE_SIZE) {
+          ctx.throw(413, `替换文件过大（超过 ${Math.floor(MAX_REPLACE_FILE_SIZE / 1024 / 1024)}MB 限制）`);
+        }
+
         const result = await plugin.cleanerService.replaceFile(
           attachmentId,
           {
@@ -215,5 +242,15 @@ export function registerCleanerActions(plugin: PluginAttachmentCleanerServer) {
     },
   });
 
-  plugin.app.acl.allow('attachmentCleaners', '*', 'loggedIn');
+  // 权限策略：清理工具涉及物理删除、文件覆盖、引用改写、审计清空等高危操作，
+  // 一律仅允许管理员执行；普通登录用户仅保留只读查询能力。
+  const readOnlyActions = [
+    'getScanProgress',
+    'getLastScanResult',
+    'getSettings',
+    'storages',
+    'auditLogs',
+  ];
+  plugin.app.acl.allow('attachmentCleaners', readOnlyActions, 'loggedIn');
+  plugin.app.acl.allow('attachmentCleaners', '*', 'admin');
 }

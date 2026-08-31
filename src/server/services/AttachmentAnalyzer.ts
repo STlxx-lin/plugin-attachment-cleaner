@@ -111,7 +111,69 @@ const SYSTEM_EXCLUDE_COLLECTIONS = new Set([
 
 const BATCH_SIZE = 300;
 
+/** 内容哈希统一前缀：只有携带该前缀的指纹才可参与去重判定（防止历史元数据指纹混入） */
+export const CONTENT_HASH_PREFIX = 'sha256:';
+
+/**
+ * 富文本 / 长文本中提取附件引用的正则（全局标志，使用前需重置 lastIndex）。
+ * 第三分支使用 Unicode 友好的字符集（含中文文件名），并排除 URL 分隔符避免跨段误匹配。
+ */
+export const ATTACHMENT_REF_REGEX =
+  /(?:src|href)\s*=\s*["']([^"']+)["']|(?:\/api\/(?:attachments|files)\/([^\s"'<>]+))|([^\s"'<>(){}[\],;\\?#=]+\.[a-zA-Z0-9]+)/gi;
+
+/** 安全 decodeURIComponent（最多两层，容错非法编码序列） */
+export function safeDecodeVariants(value: string): string[] {
+  const out = [value];
+  let cur = value;
+  for (let i = 0; i < 2; i++) {
+    try {
+      const dec = decodeURIComponent(cur);
+      if (dec === cur) break;
+      out.push(dec);
+      cur = dec;
+    } catch {
+      break;
+    }
+  }
+  return out;
+}
+
+/** 全文件 sha256 内容指纹。读取异常时返回空串（调用方应跳过该文件，不得参与去重） */
+export async function hashStreamToContentHash(stream: any): Promise<string> {
+  return new Promise<string>((resolve) => {
+    const hash = crypto.createHash('sha256');
+    let done = false;
+    const finish = (val: string) => {
+      if (done) return;
+      done = true;
+      try {
+        if (typeof stream.destroy === 'function') stream.destroy();
+      } catch {
+        // ignore
+      }
+      resolve(val);
+    };
+    stream.on('data', (chunk: Buffer) => {
+      if (done) return;
+      hash.update(chunk);
+    });
+    stream.on('end', () => finish(CONTENT_HASH_PREFIX + hash.digest('hex')));
+    stream.on('error', () => finish(''));
+    // 未正常 end 就关闭（外部中断）视为无法计算，宁可漏判不可误判
+    stream.on('close', () => finish(''));
+  });
+}
+
+export interface AttachmentFileStream {
+  stream: any;
+  contentType?: string;
+}
+
+export type FileStreamProvider = (att: any) => Promise<AttachmentFileStream | null> | AttachmentFileStream | null;
+
 export class AttachmentAnalyzer {
+  private fileStreamProvider?: FileStreamProvider;
+
   constructor(private app: Application) {}
 
   private get db(): Database {
@@ -119,12 +181,61 @@ export class AttachmentAnalyzer {
   }
 
   /**
-   * 构建附件快速检索索引 (O(1) 内存查询)
+   * 注入文件流读取器（测试或自定义存储接入用）。未注入时使用 file-manager 插件的 getFileStream。
+   */
+  setFileStreamProvider(provider?: FileStreamProvider) {
+    this.fileStreamProvider = provider;
+  }
+
+  /** 解析附件的物理文件流；无法获取时返回 null（不参与内容指纹计算） */
+  private async resolveFileStream(att: any): Promise<AttachmentFileStream | null> {
+    if (this.fileStreamProvider) {
+      try {
+        return await this.fileStreamProvider(att);
+      } catch {
+        return null;
+      }
+    }
+    let fileManagerPlugin: any = null;
+    try {
+      fileManagerPlugin = this.app.pm.get(PluginFileManagerServer);
+    } catch {
+      return null;
+    }
+    if (!fileManagerPlugin || typeof fileManagerPlugin.getFileStream !== 'function') {
+      return null;
+    }
+    try {
+      return await fileManagerPlugin.getFileStream(att);
+    } catch (e) {
+      this.app.logger?.warn?.(
+        `[attachment-cleaner] 读取文件流失败，该文件不参与重复内容比对: ${att?.get?.('filename') || att?.filename || '未知'}`,
+      );
+      return null;
+    }
+  }
+
+  /**
+   * 构建附件快速检索索引 (O(1) 内存查询)。
+   * filename/url/urlTail 均为多值映射：同名或同 URL 尾段的附件全部标记为可能被引用（宁保守勿误删）。
    */
   private buildAttachmentIndex(allAttachments: any[]) {
     const idSet = new Set<string | number>();
-    const filenameMap = new Map<string, string | number>();
-    const urlMap = new Map<string, string | number>();
+    const filenameMap = new Map<string, Set<string | number>>();
+    const urlMap = new Map<string, Set<string | number>>();
+    const urlTailMap = new Map<string, Set<string | number>>();
+
+    const addKey = (map: Map<string, Set<string | number>>, rawKey: any, id: string | number) => {
+      if (rawKey === undefined || rawKey === null) return;
+      const key = String(rawKey).trim();
+      if (!key) return;
+      let set = map.get(key);
+      if (!set) {
+        set = new Set<string | number>();
+        map.set(key, set);
+      }
+      set.add(id);
+    };
 
     for (const att of allAttachments) {
       const id = att.get ? att.get('id') : att.id;
@@ -135,19 +246,54 @@ export class AttachmentAnalyzer {
         idSet.add(id);
         idSet.add(String(id));
       }
-      if (filename) {
-        filenameMap.set(String(filename).trim(), id);
-      }
+      addKey(filenameMap, filename, id);
       if (url) {
-        urlMap.set(String(url).trim(), id);
+        const urlStr = String(url).trim();
+        addKey(urlMap, urlStr, id);
+        for (const dec of safeDecodeVariants(urlStr)) {
+          addKey(urlMap, dec, id);
+        }
+        // URL 尾段（去查询参数后最后一段路径）用于富文本中域名/路径不同但文件名一致的引用
+        const tail = urlStr.split(/[?#]/)[0].split('/').filter(Boolean).pop();
+        if (tail) {
+          addKey(urlTailMap, tail, id);
+          for (const dec of safeDecodeVariants(tail)) {
+            addKey(urlTailMap, dec, id);
+          }
+        }
       }
     }
 
-    return { idSet, filenameMap, urlMap };
+    return { idSet, filenameMap, urlMap, urlTailMap };
+  }
+
+  /** 将一段文本片段按 原文 / 解码 / 去查询参数 / 尾段 四种变体与附件索引比对，命中即标记为已引用 */
+  private markUsedCandidates(
+    candidate: string,
+    index: ReturnType<AttachmentAnalyzer['buildAttachmentIndex']>,
+    usedIds: Set<string | number>,
+  ) {
+    if (!candidate) return;
+    const variants = new Set<string>();
+    for (const dec of safeDecodeVariants(String(candidate).trim())) {
+      variants.add(dec);
+      const noQuery = dec.split(/[?#]/)[0];
+      if (noQuery) {
+        variants.add(noQuery);
+        const seg = noQuery.split('/').filter(Boolean).pop();
+        if (seg) variants.add(seg);
+      }
+    }
+    for (const v of variants) {
+      index.filenameMap.get(v)?.forEach((id) => usedIds.add(id));
+      index.urlMap.get(v)?.forEach((id) => usedIds.add(id));
+      index.urlTailMap.get(v)?.forEach((id) => usedIds.add(id));
+    }
   }
 
   /**
-   * 异步非阻塞检测物理磁盘文件是否存在（精准按需探测 + 内存缓存，彻底替代同步全盘递归）
+   * 异步非阻塞检测物理磁盘文件是否存在（按需探测 + 按存储根缓存的内存缓存）。
+   * 缓存键包含存储根目录：不同 root 下的同名文件互不混淆，避免跨存储误判为存在。
    */
   private async checkPhysicalFileExists(
     filename: string,
@@ -159,31 +305,29 @@ export class AttachmentAnalyzer {
     const normalizedRec = (recPath || '').replace(/\\/g, '/').replace(/^\//, '');
     const relKey = normalizedRec ? `${normalizedRec}/${filename}` : filename;
 
-    if (diskCache.has(relKey)) {
-      return diskCache.get(relKey)!;
-    }
-
     for (const root of docRoots) {
       const absRoot = path.isAbsolute(root) ? root : path.resolve(process.cwd(), root);
-      const candidatePath1 = path.join(absRoot, relKey);
-      const candidatePath2 = path.join(absRoot, filename);
+      const cacheKey = `${absRoot}|${relKey}`;
+      if (diskCache.has(cacheKey)) {
+        return diskCache.get(cacheKey)!;
+      }
 
+      let exists = false;
       try {
-        await fs.promises.access(candidatePath1);
-        diskCache.set(relKey, true);
-        return true;
+        await fs.promises.access(path.join(absRoot, relKey));
+        exists = true;
       } catch {
         try {
-          await fs.promises.access(candidatePath2);
-          diskCache.set(relKey, true);
-          return true;
+          await fs.promises.access(path.join(absRoot, filename));
+          exists = true;
         } catch {
           // 继续检查下一个 root
         }
       }
+      diskCache.set(cacheKey, exists);
+      if (exists) return true;
     }
 
-    diskCache.set(relKey, false);
     return false;
   }
 
@@ -195,32 +339,24 @@ export class AttachmentAnalyzer {
     usedIds: Set<string | number>,
   ): Promise<void> {
     if (!allAttachments || allAttachments.length === 0) return;
-    const { idSet, filenameMap, urlMap } = this.buildAttachmentIndex(allAttachments);
+    const index = this.buildAttachmentIndex(allAttachments);
+    const { idSet, filenameMap, urlMap } = index;
 
     const extractFromValue = (val: any) => {
       if (val === null || val === undefined) return;
       if (typeof val === 'number' || typeof val === 'string') {
         if (idSet.has(val)) usedIds.add(val);
-        const byFilename = filenameMap.get(String(val).trim());
-        if (byFilename !== undefined) usedIds.add(byFilename);
-        const byUrl = urlMap.get(String(val).trim());
-        if (byUrl !== undefined) usedIds.add(byUrl);
+        filenameMap.get(String(val).trim())?.forEach((id) => usedIds.add(id));
+        urlMap.get(String(val).trim())?.forEach((id) => usedIds.add(id));
 
         if (typeof val === 'string' && (val.includes('/') || val.includes('.'))) {
-          const urlRegex = /(?:src|href)=["']([^"']+)["']|(?:\/api\/attachments\/([^\s"'<>]+))|([a-zA-Z0-9_-]+\.[a-zA-Z0-9]+)/gi;
+          ATTACHMENT_REF_REGEX.lastIndex = 0;
           let match;
-          while ((match = urlRegex.exec(val)) !== null) {
-            if (match[1]) {
-              const id = filenameMap.get(match[1]) ?? urlMap.get(match[1]);
-              if (id !== undefined) usedIds.add(id);
-            }
-            if (match[2]) {
-              const id = filenameMap.get(match[2]) ?? urlMap.get(match[2]);
-              if (id !== undefined) usedIds.add(id);
-            }
-            if (match[3]) {
-              const id = filenameMap.get(match[3]);
-              if (id !== undefined) usedIds.add(id);
+          while ((match = ATTACHMENT_REF_REGEX.exec(val)) !== null) {
+            for (let i = 1; i <= 3; i++) {
+              if (match[i]) {
+                this.markUsedCandidates(match[i], index, usedIds);
+              }
             }
           }
         }
@@ -230,11 +366,11 @@ export class AttachmentAnalyzer {
         if (val.id !== undefined && idSet.has(val.id)) {
           usedIds.add(val.id);
         }
-        if (val.filename && filenameMap.has(val.filename)) {
-          usedIds.add(filenameMap.get(val.filename)!);
+        if (val.filename && filenameMap.has(String(val.filename).trim())) {
+          filenameMap.get(String(val.filename).trim())?.forEach((id) => usedIds.add(id));
         }
-        if (val.url && urlMap.has(val.url)) {
-          usedIds.add(urlMap.get(val.url)!);
+        if (val.url && urlMap.has(String(val.url).trim())) {
+          urlMap.get(String(val.url).trim())?.forEach((id) => usedIds.add(id));
         }
         for (const k of Object.keys(val)) {
           extractFromValue(val[k]);
@@ -315,7 +451,7 @@ export class AttachmentAnalyzer {
       startIndex?: number;
       initialUsedIds?: Set<string | number>;
       shouldPause?: () => boolean;
-      onCheckpoint?: (index: number, usedIds: Set<string | number>) => Promise<void> | void;
+      onCheckpoint?: (index: number, usedIds: Set<string | number>, total: number) => Promise<void> | void;
       onProgress?: (info: { step: number; total: number; collectionName: string }) => void;
     },
   ): Promise<Set<string | number>> {
@@ -330,7 +466,7 @@ export class AttachmentAnalyzer {
     for (let i = startIndex; i < collections.length; i++) {
       if (options?.shouldPause && options.shouldPause()) {
         if (options.onCheckpoint) {
-          await options.onCheckpoint(i, usedIds);
+          await options.onCheckpoint(i, usedIds, totalCollections);
         }
         throw new ScanPausedError();
       }
@@ -396,7 +532,7 @@ export class AttachmentAnalyzer {
       await yieldToEventLoop();
 
       if (options?.onCheckpoint && (i % 5 === 0 || i === collections.length - 1)) {
-        await options.onCheckpoint(i + 1, usedIds);
+        await options.onCheckpoint(i + 1, usedIds, totalCollections);
       }
     }
 
@@ -412,13 +548,13 @@ export class AttachmentAnalyzer {
     options?: {
       startIndex?: number;
       shouldPause?: () => boolean;
-      onCheckpoint?: (index: number, usedIds: Set<string | number>) => Promise<void> | void;
+      onCheckpoint?: (index: number, usedIds: Set<string | number>, total: number) => Promise<void> | void;
       onProgress?: (info: { step: number; total: number; collectionName: string }) => void;
     },
   ): Promise<void> {
     if (!allAttachments || allAttachments.length === 0) return;
 
-    const { filenameMap, urlMap } = this.buildAttachmentIndex(allAttachments);
+    const index = this.buildAttachmentIndex(allAttachments);
     const collections = Array.from(this.db.collections.values()).filter(
       (c) => !SYSTEM_EXCLUDE_COLLECTIONS.has(c.name),
     );
@@ -429,7 +565,7 @@ export class AttachmentAnalyzer {
     for (let i = startIndex; i < collections.length; i++) {
       if (options?.shouldPause && options.shouldPause()) {
         if (options.onCheckpoint) {
-          await options.onCheckpoint(i, usedIds);
+          await options.onCheckpoint(i, usedIds, totalCollections);
         }
         throw new ScanPausedError();
       }
@@ -499,24 +635,12 @@ export class AttachmentAnalyzer {
 
               if (!val.includes('/') && !val.includes('.')) continue;
 
-              const urlRegex = /(?:src|href)=["']([^"']+)["']|(?:\/api\/attachments\/([^\s"'<>]+))|([a-zA-Z0-9_-]+\.[a-zA-Z0-9]+)/gi;
-              let match;
-              while ((match = urlRegex.exec(val)) !== null) {
-                const matchedFile1 = match[1];
-                const matchedFile2 = match[2];
-                const matchedFile3 = match[3];
-
-                if (matchedFile1) {
-                  const id = filenameMap.get(matchedFile1) ?? urlMap.get(matchedFile1);
-                  if (id !== undefined) usedIds.add(id);
-                }
-                if (matchedFile2) {
-                  const id = filenameMap.get(matchedFile2) ?? urlMap.get(matchedFile2);
-                  if (id !== undefined) usedIds.add(id);
-                }
-                if (matchedFile3 && (matchedFile3.includes('.') || matchedFile3.length > 5)) {
-                  const id = filenameMap.get(matchedFile3);
-                  if (id !== undefined) usedIds.add(id);
+              ATTACHMENT_REF_REGEX.lastIndex = 0;
+              for (const match of val.matchAll(ATTACHMENT_REF_REGEX)) {
+                for (let i = 1; i <= 3; i++) {
+                  if (match[i]) {
+                    this.markUsedCandidates(match[i], index, usedIds);
+                  }
                 }
               }
             }
@@ -531,13 +655,14 @@ export class AttachmentAnalyzer {
       await yieldToEventLoop();
 
       if (options?.onCheckpoint && (i % 5 === 0 || i === collections.length - 1)) {
-        await options.onCheckpoint(i + 1, usedIds);
+        await options.onCheckpoint(i + 1, usedIds, totalCollections);
       }
     }
   }
 
   /**
-   * 查找重复附件组（头尾微采样预过滤 + 256KB 分块指纹 + 全量复合智能缓存 + 事件循环调度）
+   * 查找重复附件组（size+extname 预过滤 + 全文件 sha256 内容指纹 + 复合缓存 + 事件循环调度）。
+   * 只有能读取到文件内容并计算出指纹的附件才会参与分组；指纹无法计算的文件一律跳过，宁可漏报不可误判。
    */
   async findDuplicateGroups(
     attachments: any[],
@@ -546,7 +671,7 @@ export class AttachmentAnalyzer {
       cacheMap?: FingerprintCacheMap;
       shouldPause?: () => boolean;
       onUpdateCache?: (attachmentId: string | number, entry: FileFingerprintCacheEntry) => void;
-      onCheckpoint?: (index: number) => Promise<void> | void;
+      onCheckpoint?: (index: number, total: number) => Promise<void> | void;
       onProgress?: (info: { step: number; total: number }) => void;
     },
   ): Promise<Map<string, any[]>> {
@@ -568,7 +693,6 @@ export class AttachmentAnalyzer {
     }
 
     const duplicateGroups = new Map<string, any[]>();
-    const fileManagerPlugin = this.app.pm.get(PluginFileManagerServer) as PluginFileManagerServer;
 
     const candidateEntries = Array.from(candidateGroups.entries()).filter(([, candidates]) => candidates.length >= 2);
     const totalCandidates = candidateEntries.length || 1;
@@ -577,7 +701,7 @@ export class AttachmentAnalyzer {
     for (let idx = startIndex; idx < candidateEntries.length; idx++) {
       if (options?.shouldPause && options.shouldPause()) {
         if (options.onCheckpoint) {
-          await options.onCheckpoint(idx);
+          await options.onCheckpoint(idx, totalCandidates);
         }
         throw new ScanPausedError();
       }
@@ -597,79 +721,31 @@ export class AttachmentAnalyzer {
 
         let fileHash = '';
 
-        // 1. 命中全量复合智能缓存（id + size + updatedAt 匹配直接命中，0ms 跳过）
+        // 1. 命中全量复合智能缓存（id + size + updatedAt 匹配且为内容指纹格式时直接命中，0ms 跳过）
         const cached = options?.cacheMap?.get(attId);
-        if (cached && cached.size === attSize && String(cached.updatedAt || '') === attUpdated && cached.fileHash) {
+        if (
+          cached &&
+          cached.size === attSize &&
+          String(cached.updatedAt || '') === attUpdated &&
+          typeof cached.fileHash === 'string' &&
+          cached.fileHash.startsWith(CONTENT_HASH_PREFIX)
+        ) {
           fileHash = cached.fileHash;
         } else {
-          // 2. 缓存未命中：使用 256KB 极速分块指纹计算
+          // 2. 缓存未命中：计算全文件 sha256 内容指纹。
+          //    去重结果会驱动回收/删除操作，指纹必须基于文件内容；
+          //    无法读取文件流（无 file-manager、读取失败）时保持空串，该文件不参与分组，
+          //    绝不允许退化为 size+filename 之类的元数据指纹，否则会把不同内容的文件误判为重复。
           try {
-            if (fileManagerPlugin) {
-              const { stream } = await fileManagerPlugin.getFileStream(att);
-              fileHash = await new Promise<string>((resolve) => {
-                const hash = crypto.createHash('sha256');
-                let totalBytes = 0;
-                let isDone = false;
-                const MAX_FINGERPRINT_BYTES = 256 * 1024; // 256KB 快速分块指纹
-
-                const complete = (val: string) => {
-                  if (isDone) return;
-                  isDone = true;
-                  resolve(val);
-                };
-
-                stream.on('data', (chunk: Buffer) => {
-                  if (isDone) return;
-                  totalBytes += chunk.length;
-                  hash.update(chunk);
-                  if (totalBytes >= MAX_FINGERPRINT_BYTES) {
-                    try {
-                      const digest = hash.digest('hex');
-                      if (typeof (stream as any).destroy === 'function') {
-                        (stream as any).destroy();
-                      }
-                      complete(`${digest}_${attSize}`);
-                    } catch (e) {
-                      complete(`${attSize}_${att.get ? att.get('filename') : att.filename}`);
-                    }
-                  }
-                });
-
-                stream.on('end', () => {
-                  if (!isDone) {
-                    try {
-                      complete(hash.digest('hex'));
-                    } catch (e) {
-                      complete(`${attSize}_${att.get ? att.get('filename') : att.filename}`);
-                    }
-                  }
-                });
-
-                stream.on('error', () => {
-                  if (!isDone) {
-                    isDone = true;
-                    resolve(`${attSize}_${att.get ? att.get('filename') : att.filename}`);
-                  }
-                });
-
-                stream.on('close', () => {
-                  if (!isDone) {
-                    try {
-                      complete(hash.digest('hex'));
-                    } catch (e) {
-                      complete(`${attSize}_${att.get ? att.get('filename') : att.filename}`);
-                    }
-                  }
-                });
-              });
-            } else {
-              fileHash = `${attSize}_${att.get ? att.get('filename') : att.filename}`;
+            const source = await this.resolveFileStream(att);
+            if (source?.stream) {
+              fileHash = await hashStreamToContentHash(source.stream);
             }
           } catch (e) {
-            fileHash = `${attSize}_${att.get ? att.get('filename') : att.filename}`;
+            fileHash = '';
           }
 
-          // 回写缓存
+          // 回写缓存（仅记录真实内容指纹）
           if (fileHash && options?.onUpdateCache) {
             options.onUpdateCache(attId, {
               size: attSize,
@@ -701,7 +777,7 @@ export class AttachmentAnalyzer {
       }
 
       if (options?.onCheckpoint && (idx % 10 === 0 || idx === candidateEntries.length - 1)) {
-        await options.onCheckpoint(idx + 1);
+        await options.onCheckpoint(idx + 1, totalCandidates);
       }
     }
 
@@ -844,7 +920,6 @@ export class AttachmentAnalyzer {
     const recycledRecords = recycleRepo ? await recycleRepo.find() : [];
 
     const storageMap = new Map<string | number, { title: string; name: string; type: string; options?: any }>();
-    const docRoots: string[] = ['storage/uploads'];
 
     try {
       const storagesRepo = this.db.getRepository('storages');
@@ -857,10 +932,6 @@ export class AttachmentAnalyzer {
             type: s.get('type'),
             options: s.get('options'),
           });
-          const root = s.get('options')?.documentRoot;
-          if (root && typeof root === 'string') {
-            docRoots.push(root);
-          }
         }
       }
     } catch (e) {}
@@ -900,13 +971,13 @@ export class AttachmentAnalyzer {
       startIndex: relationsStartIndex,
       initialUsedIds: usedIds,
       shouldPause,
-      onCheckpoint: async (index, curUsedIds) => {
+      onCheckpoint: async (index, curUsedIds, total) => {
         if (options?.onSaveCheckpoint) {
           await options.onSaveCheckpoint({
             taskId: checkpoint?.taskId || `scan_${Date.now()}`,
             phase: 'relations',
             phaseText: `正在分析模型关联字段 (${index})`,
-            percent: 10 + Math.floor((index / 100) * 30),
+            percent: 10 + Math.floor((index / (total || 1)) * 30),
             relationsIndex: index,
             textsIndex: 0,
             duplicatesIndex: 0,
@@ -944,13 +1015,13 @@ export class AttachmentAnalyzer {
     await this.scanTextReferences(allAttachments, usedIds, {
       startIndex: textsStartIndex,
       shouldPause,
-      onCheckpoint: async (index, curUsedIds) => {
+      onCheckpoint: async (index, curUsedIds, total) => {
         if (options?.onSaveCheckpoint) {
           await options.onSaveCheckpoint({
             taskId: checkpoint?.taskId || `scan_${Date.now()}`,
             phase: 'texts',
             phaseText: `正在检索文本内容 (${index})`,
-            percent: 40 + Math.floor((index / 100) * 35),
+            percent: 40 + Math.floor((index / (total || 1)) * 35),
             relationsIndex: 999999,
             textsIndex: index,
             duplicatesIndex: 0,
@@ -990,13 +1061,13 @@ export class AttachmentAnalyzer {
       cacheMap,
       shouldPause,
       onUpdateCache: options?.onUpdateCache,
-      onCheckpoint: async (index) => {
+      onCheckpoint: async (index, total) => {
         if (options?.onSaveCheckpoint) {
           await options.onSaveCheckpoint({
             taskId: checkpoint?.taskId || `scan_${Date.now()}`,
             phase: 'duplicates',
             phaseText: `正在比对重复文件指纹 (${index})`,
-            percent: 75 + Math.floor((index / 100) * 20),
+            percent: 75 + Math.floor((index / (total || 1)) * 20),
             relationsIndex: 999999,
             textsIndex: 999999,
             duplicatesIndex: index,
@@ -1075,7 +1146,7 @@ export class AttachmentAnalyzer {
       const storageId = att.get('storageId');
       const storage = storageId !== undefined && storageId !== null ? storageMap.get(storageId) : undefined;
 
-      // 物理文件检测：优先查询复合智能缓存，未命中走异步非阻塞按需探测
+      // 物理文件检测：只探测该附件所属存储的 documentRoot 与默认根目录，避免跨存储误判为存在
       let isMissingFile = false;
       const cached = cacheMap.get(id);
       if (cached && cached.size === size && String(cached.updatedAt || '') === attUpdated && typeof cached.isMissingFile === 'boolean') {
@@ -1083,23 +1154,32 @@ export class AttachmentAnalyzer {
       } else {
         const filename = att.get('filename');
         const recPath = att.get('path') || '';
-        if (storage?.type === 'local' || !storage || (!att.get('url') && filename)) {
-          if (filename) {
-            const exists = await this.checkPhysicalFileExists(filename, recPath, docRoots, diskCache);
-            if (!exists) {
-              isMissingFile = true;
-            }
-          } else {
+        const needsLocalCheck = storage?.type === 'local' || !storage || (!att.get('url') && filename);
+        if (needsLocalCheck && filename) {
+          const attRoots: string[] = [];
+          const root = storage?.options?.documentRoot;
+          if (typeof root === 'string' && root) {
+            attRoots.push(root);
+          }
+          attRoots.push('storage/uploads');
+          const exists = await this.checkPhysicalFileExists(filename, recPath, attRoots, diskCache);
+          if (!exists) {
             isMissingFile = true;
           }
+        } else if (needsLocalCheck && !filename) {
+          isMissingFile = true;
         }
 
         if (options?.onUpdateCache) {
+          const cachedHash =
+            typeof cached?.fileHash === 'string' && cached.fileHash.startsWith(CONTENT_HASH_PREFIX)
+              ? cached.fileHash
+              : '';
           options.onUpdateCache(id, {
             size,
             updatedAt: attUpdated,
             path: attPath,
-            fileHash: cached?.fileHash || '',
+            fileHash: cachedHash,
             isMissingFile,
             cachedAt: Date.now(),
           });

@@ -6,6 +6,9 @@ dist/
 lib/
 coverage/
 
+# Test runtime artifacts (mock server storage)
+storage/
+
 # Temporary files & logs
 *.log
 .env

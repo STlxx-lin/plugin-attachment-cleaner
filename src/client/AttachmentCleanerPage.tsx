@@ -146,8 +146,83 @@ export const AttachmentCleanerPage: React.FC = () => {
   const [auditSearchText, setAuditSearchText] = useState<string>('');
   const [storages, setStorages] = useState<{ id: string | number; title?: string; name?: string; type?: string }[]>([]);
 
+  // 服务端分页快照状态
+  const [activeTabKey, setActiveTabKey] = useState<string>('all');
+  const [snapshotPage, setSnapshotPage] = useState(1);
+  const [snapshotPageSize, setSnapshotPageSize] = useState(50);
+  const [snapshotTotal, setSnapshotTotal] = useState(0);
+  const [snapshotTruncated, setSnapshotTruncated] = useState(false);
+  const [snapshotSearch, setSnapshotSearch] = useState('');
+  const [replaceTargetOptions, setReplaceTargetOptions] = useState<{ value: any; label: string }[]>([]);
+  const dedupTimerRef = useRef<any>(null);
+
   // NocoBase 会把 action 响应包为 { data: <body> }，这里取里面的真实载荷
   const unwrapBody = (res: any) => res?.data?.data ?? res?.data;
+
+  // Tab key -> 服务端过滤条件
+  const TAB_FILTER_MAP: Record<string, string> = {
+    all: 'all',
+    unused: 'unused',
+    duplicate: 'duplicate',
+    recycled: 'recycled',
+    audit: 'all',
+  };
+
+  // 服务端分页获取快照条目（tab 由当前 Tab 决定，条目不整包下发）。
+  // 注意：参数名用 tab 而非 filter——NocoBase 会拦截名为 filter 的查询参数做内建过滤解析，
+  // 导致自定义 action 被绕过并返回空结果。
+  const fetchSnapshotPage = async (overrides?: {
+    page?: number;
+    pageSize?: number;
+    filter?: string;
+    search?: string;
+  }) => {
+    try {
+      const params = {
+        page: overrides?.page ?? snapshotPage,
+        pageSize: overrides?.pageSize ?? snapshotPageSize,
+        tab: overrides?.filter ?? TAB_FILTER_MAP[activeTabKey] ?? 'all',
+        search: overrides?.search ?? snapshotSearch,
+      };
+      const res = await api.request({ url: 'attachmentCleaners:getLastScanResult', params });
+      const payload = unwrapBody(res);
+      if (!payload) return null;
+
+      if (payload.lastScannedAt) {
+        setLastScannedAt(new Date(payload.lastScannedAt).toLocaleString());
+      }
+      if (payload.checkpoint) {
+        setCheckpoint(payload.checkpoint);
+      }
+      const result = payload.result || {};
+      setData({
+        items: Array.isArray(result.items) ? result.items : [],
+        stats: {
+          totalCount: 0,
+          totalSize: 0,
+          unusedCount: 0,
+          unusedSize: 0,
+          duplicateCount: 0,
+          duplicateWastedSize: 0,
+          recycledCount: 0,
+          missingFileCount: 0,
+          missingFileSize: 0,
+          ...(result.stats ?? {}),
+        },
+      });
+      setSnapshotTotal(result.total || 0);
+      setSnapshotTruncated(Boolean(result.truncated));
+      return payload;
+    } catch (err) {
+      return null;
+    }
+  };
+
+  // 轮询回调中需要调用最新闭包的 fetchSnapshotPage（避免过期 state）
+  const fetchSnapshotPageRef = useRef<(overrides?: any) => Promise<any>>(async () => null);
+  useEffect(() => {
+    fetchSnapshotPageRef.current = fetchSnapshotPage;
+  });
 
   const stopPolling = () => {
     if (pollTimerRef.current) {
@@ -160,23 +235,40 @@ export const AttachmentCleanerPage: React.FC = () => {
     }
   };
 
-  const applyAnalysisResult = (payload: any) => {
-    if (!payload || typeof payload !== 'object') return;
-    setData({
-      items: Array.isArray(payload.items) ? payload.items : [],
-      stats: {
-        totalCount: 0,
-        totalSize: 0,
-        unusedCount: 0,
-        unusedSize: 0,
-        duplicateCount: 0,
-        duplicateWastedSize: 0,
-        recycledCount: 0,
-        missingFileCount: 0,
-        missingFileSize: 0,
-        ...(payload.stats ?? {}),
-      },
-    });
+  // 轻量轮询后台扫描进度（仅刷新进度条，不阻塞页面交互）；完成/暂停/失败时收尾
+  const startProgressPolling = (startTime: number) => {
+    pollTimerRef.current = setInterval(async () => {
+      try {
+        const pRes = await api.request({
+          url: 'attachmentCleaners:getScanProgress',
+        });
+        const progress: ScanProgressInfo = unwrapBody(pRes);
+        if (!progress) return;
+
+        setScanProgress(progress);
+
+        if (progress.status === 'completed') {
+          stopPolling();
+          setCheckpoint(null);
+          // 条目统一从分页快照接口获取
+          await fetchSnapshotPageRef.current({ page: 1 });
+          message.success(
+            `后台全盘扫描已完成！耗时 ${((progress.durationMs || Date.now() - startTime) / 1000).toFixed(1)} 秒`,
+          );
+        } else if (progress.status === 'paused') {
+          stopPolling();
+          if (progress.checkpoint) {
+            setCheckpoint(progress.checkpoint);
+          }
+          message.info('后台扫描任务已暂停，断点已安全保存');
+        } else if (progress.status === 'failed') {
+          stopPolling();
+          message.error(progress.error || '后台扫描中断失败');
+        }
+      } catch (pollErr) {
+        // 容忍单次轮询网络抖动
+      }
+    }, 1500);
   };
 
   // 纯后台异步扫描：立即返回，不锁死前台 UI
@@ -207,41 +299,7 @@ export const AttachmentCleanerPage: React.FC = () => {
         key: 'scanNotice',
       });
 
-      // 启动轻量轮询获取进度（仅用于刷新进度条，不阻塞页面交互）
-      pollTimerRef.current = setInterval(async () => {
-        try {
-          const pRes = await api.request({
-            url: 'attachmentCleaners:getScanProgress',
-          });
-          const progress: ScanProgressInfo = unwrapBody(pRes);
-          if (!progress) return;
-
-          setScanProgress(progress);
-
-          if (progress.status === 'completed') {
-            stopPolling();
-            setCheckpoint(null);
-            if (progress.result) {
-              applyAnalysisResult(progress.result);
-              setLastScannedAt(new Date().toLocaleString());
-            }
-            message.success(
-              `后台全盘扫描已完成！耗时 ${((progress.durationMs || Date.now() - startTime) / 1000).toFixed(1)} 秒`,
-            );
-          } else if (progress.status === 'paused') {
-            stopPolling();
-            if (progress.checkpoint) {
-              setCheckpoint(progress.checkpoint);
-            }
-            message.info('后台扫描任务已暂停，断点已安全保存');
-          } else if (progress.status === 'failed') {
-            stopPolling();
-            message.error(progress.error || '后台扫描中断失败');
-          }
-        } catch (pollErr) {
-          // 容忍单次轮询网络抖动
-        }
-      }, 1500);
+      startProgressPolling(startTime);
     } catch (e: any) {
       stopPolling();
       message.error(e?.message || '启动全盘扫描失败');
@@ -331,70 +389,42 @@ export const AttachmentCleanerPage: React.FC = () => {
     } catch (e) {}
   };
 
-  // 页面加载时拉取快照与断点检查点（秒开，无缝重连后台任务，绝不重复触发扫描）
+  // 替换目标远程搜索（快照已服务端分页，不能依赖当前页数据做候选列表）
+  const fetchReplaceTargets = async (search = '') => {
+    try {
+      const res = await api.request({
+        url: 'attachmentCleaners:getLastScanResult',
+        params: { page: 1, pageSize: 50, tab: 'all', search },
+      });
+      const payload = unwrapBody(res);
+      const list = Array.isArray(payload?.result?.items) ? payload.result.items : [];
+      setReplaceTargetOptions(
+        list
+          .filter((item: any) => String(item.id) !== String(currentReplaceRecord?.id))
+          .map((item: any) => ({
+            value: item.id,
+            label: `${item.title || item.filename} (ID: ${item.id}, ${formatSize(item.size)})`,
+          })),
+      );
+    } catch (e) {}
+  };
+
+  // 页面加载时拉取快照分页与断点检查点（秒开，无缝重连后台任务，绝不重复触发扫描）
   useEffect(() => {
     const initLoad = async () => {
-      try {
-        const res = await api.request({ url: 'attachmentCleaners:getLastScanResult' });
-        const payload = unwrapBody(res);
+      const payload = await fetchSnapshotPage();
 
-        if (payload) {
-          if (payload.lastScannedAt) {
-            setLastScannedAt(new Date(payload.lastScannedAt).toLocaleString());
-          }
-
-          if (payload.checkpoint) {
-            setCheckpoint(payload.checkpoint);
-          }
-
-          // 如果后台有正在运行的异步任务，无缝接入轮询与计时器，绝对不重复启动扫描！
-          if (payload.taskState && payload.taskState.status === 'running') {
-            setScanProgress(payload.taskState);
-            const startedAt = payload.taskState.startedAt || Date.now();
-            setElapsedTime(Math.max(0, Math.floor((Date.now() - startedAt) / 1000)));
-            elapsedTimerRef.current = setInterval(() => {
-              setElapsedTime(Math.max(0, Math.floor((Date.now() - startedAt) / 1000)));
-            }, 1000);
-
-            pollTimerRef.current = setInterval(async () => {
-              try {
-                const pRes = await api.request({ url: 'attachmentCleaners:getScanProgress' });
-                const curProgress: ScanProgressInfo = unwrapBody(pRes);
-                if (!curProgress) return;
-                setScanProgress(curProgress);
-                if (curProgress.status === 'completed') {
-                  stopPolling();
-                  setCheckpoint(null);
-                  if (curProgress.result) {
-                    applyAnalysisResult(curProgress.result);
-                    setLastScannedAt(new Date().toLocaleString());
-                  }
-                  message.success('后台全盘扫描已完成！');
-                } else if (curProgress.status === 'paused') {
-                  stopPolling();
-                  if (curProgress.checkpoint) setCheckpoint(curProgress.checkpoint);
-                  message.info('后台扫描任务已暂停');
-                } else if (curProgress.status === 'failed') {
-                  stopPolling();
-                  message.error(curProgress.error || '后台扫描中断失败');
-                }
-              } catch (err) {}
-            }, 1500);
-
-            // 如果有之前留存的快照数据，也可先呈现
-            if (payload.hasSnapshot && payload.result) {
-              applyAnalysisResult(payload.result);
-            }
-            return;
-          }
-
-          // 如果有历史快照数据，直接呈现
-          if (payload.hasSnapshot && payload.result) {
-            applyAnalysisResult(payload.result);
-            return;
-          }
-        }
-      } catch (err) {}
+      // 如果后台有正在运行的异步任务，无缝接入轮询与计时器，绝对不重复启动扫描！
+      const taskState = payload?.taskState;
+      if (taskState && taskState.status === 'running') {
+        setScanProgress(taskState);
+        const startedAt = taskState.startedAt || Date.now();
+        setElapsedTime(Math.max(0, Math.floor((Date.now() - startedAt) / 1000)));
+        elapsedTimerRef.current = setInterval(() => {
+          setElapsedTime(Math.max(0, Math.floor((Date.now() - startedAt) / 1000)));
+        }, 1000);
+        startProgressPolling(startedAt);
+      }
     };
 
     initLoad();
@@ -402,6 +432,10 @@ export const AttachmentCleanerPage: React.FC = () => {
 
     return () => {
       stopPolling();
+      if (dedupTimerRef.current) {
+        clearInterval(dedupTimerRef.current);
+        dedupTimerRef.current = null;
+      }
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -415,34 +449,8 @@ export const AttachmentCleanerPage: React.FC = () => {
       });
       message.success('已放入回收站');
       setSelectedRowKeys([]);
-
-      // 本地瞬时更新状态
-      setData((prev) => {
-        const idSet = new Set(ids.map(String));
-        let unusedCountDelta = 0;
-        let unusedSizeDelta = 0;
-        const newItems = prev.items.map((item) => {
-          if (idSet.has(String(item.id))) {
-            if (item.isUnused && !item.isRecycled) {
-              unusedCountDelta--;
-              unusedSizeDelta += item.size || 0;
-            }
-            return { ...item, isRecycled: true, recycledAt: new Date() };
-          }
-          return item;
-        });
-        return {
-          ...prev,
-          items: newItems,
-          stats: {
-            ...prev.stats,
-            unusedCount: Math.max(0, prev.stats.unusedCount + unusedCountDelta),
-            unusedSize: Math.max(0, prev.stats.unusedSize - unusedSizeDelta),
-            recycledCount: prev.stats.recycledCount + idSet.size,
-          },
-        };
-      });
-
+      // 服务端已同步快照条目状态，重取当前页保证列表与统计一致
+      await fetchSnapshotPageRef.current();
       fetchAuditLogs();
     } catch (e: any) {
       message.error(e?.message || '移入回收站失败');
@@ -458,34 +466,7 @@ export const AttachmentCleanerPage: React.FC = () => {
       });
       message.success('已还原');
       setSelectedRowKeys([]);
-
-      // 本地瞬时更新状态
-      setData((prev) => {
-        const idSet = new Set(ids.map(String));
-        let unusedCountDelta = 0;
-        let unusedSizeDelta = 0;
-        const newItems = prev.items.map((item) => {
-          if (idSet.has(String(item.id))) {
-            if (item.isUnused) {
-              unusedCountDelta++;
-              unusedSizeDelta += item.size || 0;
-            }
-            return { ...item, isRecycled: false, recycledAt: undefined };
-          }
-          return item;
-        });
-        return {
-          ...prev,
-          items: newItems,
-          stats: {
-            ...prev.stats,
-            unusedCount: prev.stats.unusedCount + unusedCountDelta,
-            unusedSize: prev.stats.unusedSize + unusedSizeDelta,
-            recycledCount: Math.max(0, prev.stats.recycledCount - idSet.size),
-          },
-        };
-      });
-
+      await fetchSnapshotPageRef.current();
       fetchAuditLogs();
     } catch (e: any) {
       message.error(e?.message || '还原失败');
@@ -494,8 +475,8 @@ export const AttachmentCleanerPage: React.FC = () => {
 
   const handlePurge = async (ids: React.Key[]) => {
     Modal.confirm({
-      title: '确认彻底物理擦除附件？',
-      content: '此操作将直接删除数据库记录及物理存储文件，无法撤销！',
+      title: '确认彻底删除附件？',
+      content: '此操作将删除数据库记录并触发物理存储文件删除（file-manager afterDestroy），无法撤销！',
       okText: '彻底删除',
       okType: 'danger',
       cancelText: '取消',
@@ -506,55 +487,12 @@ export const AttachmentCleanerPage: React.FC = () => {
             method: 'post',
             data: { attachmentIds: ids },
           });
-          message.success('已物理擦除');
+          message.success('已彻底删除');
           setSelectedRowKeys([]);
-
-          // 本地瞬时从列表中剔除并更新统计
-          setData((prev) => {
-            const idSet = new Set(ids.map(String));
-            let removedTotalSize = 0;
-            let removedUnusedCount = 0;
-            let removedUnusedSize = 0;
-            let removedMissingCount = 0;
-            let removedMissingSize = 0;
-            let removedRecycledCount = 0;
-
-            const newItems = prev.items.filter((item) => {
-              if (idSet.has(String(item.id))) {
-                removedTotalSize += item.size || 0;
-                if (item.isRecycled) removedRecycledCount++;
-                if (item.isUnused) {
-                  removedUnusedCount++;
-                  removedUnusedSize += item.size || 0;
-                }
-                if (item.isMissingFile) {
-                  removedMissingCount++;
-                  removedMissingSize += item.size || 0;
-                }
-                return false;
-              }
-              return true;
-            });
-
-            return {
-              ...prev,
-              items: newItems,
-              stats: {
-                ...prev.stats,
-                totalCount: Math.max(0, prev.stats.totalCount - idSet.size),
-                totalSize: Math.max(0, prev.stats.totalSize - removedTotalSize),
-                unusedCount: Math.max(0, prev.stats.unusedCount - removedUnusedCount),
-                unusedSize: Math.max(0, prev.stats.unusedSize - removedUnusedSize),
-                recycledCount: Math.max(0, prev.stats.recycledCount - removedRecycledCount),
-                missingFileCount: Math.max(0, prev.stats.missingFileCount - removedMissingCount),
-                missingFileSize: Math.max(0, prev.stats.missingFileSize - removedMissingSize),
-              },
-            };
-          });
-
+          await fetchSnapshotPageRef.current();
           fetchAuditLogs();
         } catch (e: any) {
-          message.error(e?.message || '物理删除失败');
+          message.error(e?.message || '删除失败');
         }
       },
     });
@@ -563,37 +501,57 @@ export const AttachmentCleanerPage: React.FC = () => {
   const [dedupLoading, setDedupLoading] = useState(false);
 
   const handleDeduplicate = () => {
-    const groupIds = new Set(
-      duplicateItems.map((i) => i.duplicateGroupId).filter((id): id is string => Boolean(id)),
-    );
     Modal.confirm({
       title: '确认对重复文件去重？',
-      content: `将处理 ${groupIds.size} 组重复文件（共 ${duplicateItems.length} 个附件），每组仅保留 1 个文件，其余移入回收站，业务数据中的附件引用将自动改指向保留文件。移入回收站的文件可还原，超期后才会被自动物理擦除。`,
+      content: `将在后台处理当前扫描发现的全部重复文件组（共 ${data.stats.duplicateCount} 个重复附件），每组仅保留 1 个文件，其余移入回收站，业务数据中的附件引用将自动改指向保留文件。移入回收站的文件可还原，超期后才会被自动删除。`,
       okText: '开始去重',
       okType: 'danger',
       cancelText: '取消',
       onOk: async () => {
         setDedupLoading(true);
         try {
-          const res = await api.request({
+          // 后台异步执行：立即返回，轮询进度直到完成/失败
+          await api.request({
             url: 'attachmentCleaners:deduplicate',
             method: 'post',
           });
-          const payload = unwrapBody(res);
-          message.success(
-            `去重完成：处理 ${payload?.groups ?? 0} 组，保留 ${payload?.keptCount ?? 0} 个，移除 ${payload?.removedCount ?? 0} 个附件，更新 ${payload?.referencesUpdated ?? 0} 处引用`,
-          );
-          setSelectedRowKeys([]);
-          const snapshotRes = await api.request({ url: 'attachmentCleaners:getLastScanResult' });
-          const snapPayload = unwrapBody(snapshotRes);
-          if (snapPayload?.result) {
-            applyAnalysisResult(snapPayload.result);
+          message.info({ content: '去重任务已在后台运行...', key: 'dedupNotice' });
+
+          if (dedupTimerRef.current) {
+            clearInterval(dedupTimerRef.current);
           }
-          fetchAuditLogs();
+          dedupTimerRef.current = setInterval(async () => {
+            try {
+              const res = await api.request({ url: 'attachmentCleaners:getDedupProgress' });
+              const progress = unwrapBody(res);
+              if (!progress) return;
+
+              if (progress.status === 'completed') {
+                clearInterval(dedupTimerRef.current);
+                dedupTimerRef.current = null;
+                setDedupLoading(false);
+                const r = progress.result || {};
+                const failedCount = Array.isArray(r.failedReferences) ? r.failedReferences.length : 0;
+                message.success(
+                  `去重完成：处理 ${r.groups ?? 0} 组，保留 ${r.keptCount ?? 0} 个，移除 ${r.removedCount ?? 0} 个附件，更新 ${r.referencesUpdated ?? 0} 处引用${
+                    failedCount > 0 ? `，${failedCount} 处引用更新失败（详见审计日志）` : ''
+                  }`,
+                );
+                await fetchSnapshotPageRef.current();
+                fetchAuditLogs();
+              } else if (progress.status === 'failed') {
+                clearInterval(dedupTimerRef.current);
+                dedupTimerRef.current = null;
+                setDedupLoading(false);
+                message.error(progress.error || '去重失败');
+              }
+            } catch (err) {
+              // 容忍单次轮询网络抖动
+            }
+          }, 1200);
         } catch (e: any) {
-          message.error(e?.message || '去重失败');
-        } finally {
           setDedupLoading(false);
+          message.error(e?.message || '启动去重失败');
         }
       },
     });
@@ -649,7 +607,9 @@ export const AttachmentCleanerPage: React.FC = () => {
     setReplaceUploadFile(null);
     setReplaceTargetId(undefined);
     setRecycleSourceAtt(true);
+    setReplaceTargetOptions([]);
     setReplaceModalOpen(true);
+    fetchReplaceTargets('');
   };
 
   // 执行文件替换（优先通过系统标准 attachments:create 接口上传，然后原地覆盖或迁移）
@@ -726,49 +686,8 @@ export const AttachmentCleanerPage: React.FC = () => {
 
         message.success({ content: '文件覆盖替换成功！全部列表与业务引用已即时更新。', key: 'replaceUpload' });
 
-        const finalItem = payload?.item || payload;
-
-        // 本地状态列表乐观更新（如果原项存在则更新，若不存在则追加到列表首位）
-        setData((prev) => {
-          let updated = false;
-          const newItems = prev.items.map((item) => {
-            if (String(item.id) === String(currentReplaceRecord.id)) {
-              updated = true;
-              return {
-                ...item,
-                ...finalItem,
-                title: finalItem?.newTitle || finalItem?.title || replaceUploadFile.name,
-                filename: finalItem?.newFilename || finalItem?.filename || replaceUploadFile.name,
-                size: finalItem?.newSize || finalItem?.size || replaceUploadFile.size,
-                extname: finalItem?.extname || item.extname,
-                mimetype: finalItem?.mimetype || replaceUploadFile.type,
-                url: finalItem?.url || item.url,
-                isMissingFile: false,
-                isRecycled: false,
-                updatedAt: finalItem?.updatedAt || new Date(),
-              };
-            }
-            return item;
-          });
-
-          if (!updated && finalItem) {
-            newItems.unshift({
-              ...currentReplaceRecord,
-              ...finalItem,
-              title: finalItem?.newTitle || finalItem?.title || replaceUploadFile.name,
-              filename: finalItem?.newFilename || finalItem?.filename || replaceUploadFile.name,
-              size: finalItem?.newSize || finalItem?.size || replaceUploadFile.size,
-              isMissingFile: false,
-              isRecycled: false,
-              updatedAt: new Date(),
-            });
-          }
-
-          return {
-            ...prev,
-            items: newItems,
-          };
-        });
+        // 服务端已完成原地覆盖并更新快照条目，重取当前页保持数据一致
+        await fetchSnapshotPageRef.current();
       } else {
         if (!replaceTargetId) {
           message.warning('请选择目标附件');
@@ -787,11 +706,14 @@ export const AttachmentCleanerPage: React.FC = () => {
         });
 
         const payload = unwrapBody(res);
-        message.success(`引用迁移成功！已更新 ${payload?.referencesUpdated || 0} 处业务引用。`);
+        message.success(
+          `引用迁移成功！已更新 ${payload?.referencesUpdated || 0} 处业务引用。${
+            payload?.recycledSource === false ? '（因存在引用更新失败，源附件未移入回收站）' : ''
+          }`,
+        );
 
-        if (recycleSourceAtt) {
-          handleRecycle([currentReplaceRecord.id]);
-        }
+        // 服务端已完成回收与快照同步，重取当前页
+        await fetchSnapshotPageRef.current();
       }
 
       setReplaceModalOpen(false);
@@ -824,11 +746,8 @@ export const AttachmentCleanerPage: React.FC = () => {
     setPreviewOpen(true);
   };
 
+  // 数据由服务端按当前 Tab 过滤并分页返回（见 fetchSnapshotPage），前端不再全量持有条目
   const items = data.items ?? [];
-  const allActiveItems = items.filter((i) => !i.isRecycled);
-  const unusedItems = items.filter((i) => i.isUnused && !i.isRecycled);
-  const duplicateItems = items.filter((i) => i.isDuplicate && !i.isRecycled);
-  const recycledItems = items.filter((i) => i.isRecycled);
 
   const columns = [
     {
@@ -1150,128 +1069,125 @@ export const AttachmentCleanerPage: React.FC = () => {
 
   const isScanning = scanProgress.status === 'running';
 
+  // 快照表格：数据源为服务端按当前 Tab 过滤后的分页数据
+  const renderSnapshotTable = (toolbar: React.ReactNode) => (
+    <div>
+      <div
+        style={{
+          marginBottom: 16,
+          display: 'flex',
+          justifyContent: 'space-between',
+          alignItems: 'center',
+          flexWrap: 'wrap',
+          gap: 12,
+        }}
+      >
+        <Space wrap>{toolbar}</Space>
+        <Input
+          placeholder="搜索文件名或附件 ID（回车确认）"
+          prefix={<SearchOutlined style={{ color: '#bfbfbf' }} />}
+          value={snapshotSearch}
+          onChange={(e) => {
+            const v = e.target.value;
+            setSnapshotSearch(v);
+            if (!v) {
+              fetchSnapshotPageRef.current({ page: 1, search: '' });
+            }
+          }}
+          onPressEnter={() => fetchSnapshotPageRef.current({ page: 1, search: snapshotSearch })}
+          allowClear
+          style={{ width: 240 }}
+        />
+      </div>
+      {snapshotTruncated && (
+        <Alert
+          style={{ marginBottom: 12 }}
+          type="warning"
+          showIcon
+          message="附件数量超出快照上限，仅优先保留被标记的附件（未引用/重复/回收站/丢失），可重新扫描获取完整数据。"
+        />
+      )}
+      <Table
+        rowKey="id"
+        columns={columns}
+        dataSource={items}
+        rowSelection={{
+          selectedRowKeys,
+          onChange: (keys) => setSelectedRowKeys(keys),
+        }}
+        pagination={{
+          current: snapshotPage,
+          pageSize: snapshotPageSize,
+          total: snapshotTotal,
+          showSizeChanger: true,
+          pageSizeOptions: ['20', '50', '100', '200'],
+          showTotal: (t) => `共 ${t} 条`,
+          onChange: (p, ps) => {
+            setSnapshotPage(p);
+            setSnapshotPageSize(ps);
+            fetchSnapshotPageRef.current({ page: p, pageSize: ps });
+          },
+        }}
+      />
+    </div>
+  );
+
+  const recycleToolbar = (
+    <Button
+      type="primary"
+      danger
+      disabled={selectedRowKeys.length === 0}
+      onClick={() => handleRecycle(selectedRowKeys)}
+    >
+      批量移入回收站
+    </Button>
+  );
+
   const tabItems = [
     {
       key: 'all',
-      label: `全部附件 (${allActiveItems.length})`,
-      children: (
-        <div>
-          <div style={{ marginBottom: 16 }}>
-            <Button
-              type="primary"
-              danger
-              disabled={selectedRowKeys.length === 0}
-              onClick={() => handleRecycle(selectedRowKeys)}
-            >
-              批量移入回收站
-            </Button>
-          </div>
-          <Table
-            rowKey="id"
-            columns={columns}
-            dataSource={allActiveItems}
-            rowSelection={{
-              selectedRowKeys,
-              onChange: (keys) => setSelectedRowKeys(keys),
-            }}
-          />
-        </div>
-      ),
+      label: `全部附件 (${Math.max(0, data.stats.totalCount - data.stats.recycledCount)})`,
+      children: renderSnapshotTable(recycleToolbar),
     },
     {
       key: 'unused',
-      label: `未引用的附件 (${unusedItems.length})`,
-      children: (
-        <div>
-          <div style={{ marginBottom: 16 }}>
-            <Button
-              type="primary"
-              danger
-              disabled={selectedRowKeys.length === 0}
-              onClick={() => handleRecycle(selectedRowKeys)}
-            >
-              批量移入回收站
-            </Button>
-          </div>
-          <Table
-            rowKey="id"
-            columns={columns}
-            dataSource={unusedItems}
-            rowSelection={{
-              selectedRowKeys,
-              onChange: (keys) => setSelectedRowKeys(keys),
-            }}
-          />
-        </div>
-      ),
+      label: `未引用的附件 (${data.stats.unusedCount})`,
+      children: renderSnapshotTable(recycleToolbar),
     },
     {
       key: 'duplicate',
-      label: `重复文件分析 (${duplicateItems.length})`,
-      children: (
-        <div>
-          <div style={{ marginBottom: 16 }}>
-            <Space>
-              <Button
-                type="primary"
-                danger
-                loading={dedupLoading}
-                disabled={duplicateItems.length === 0}
-                onClick={handleDeduplicate}
-              >
-                一键去重（每组保留一个）
-              </Button>
-              <Button
-                type="primary"
-                danger
-                disabled={selectedRowKeys.length === 0}
-                onClick={() => handleRecycle(selectedRowKeys)}
-              >
-                批量移入回收站
-              </Button>
-            </Space>
-          </div>
-          <Table
-            rowKey="id"
-            columns={columns}
-            dataSource={duplicateItems}
-            rowSelection={{
-              selectedRowKeys,
-              onChange: (keys) => setSelectedRowKeys(keys),
-            }}
-          />
-        </div>
+      label: `重复文件分析 (${data.stats.duplicateCount})`,
+      children: renderSnapshotTable(
+        <>
+          <Button
+            type="primary"
+            danger
+            loading={dedupLoading}
+            disabled={data.stats.duplicateCount === 0}
+            onClick={handleDeduplicate}
+          >
+            一键去重（每组保留一个）
+          </Button>
+          {recycleToolbar}
+        </>,
       ),
     },
     {
       key: 'recycled',
-      label: `回收站 (${recycledItems.length})`,
-      children: (
-        <div>
-          <div style={{ marginBottom: 16 }}>
-            <Space>
-              <Button
-                type="primary"
-                disabled={selectedRowKeys.length === 0}
-                onClick={() => handleRestore(selectedRowKeys)}
-              >
-                批量还原
-              </Button>
-              <Button danger disabled={selectedRowKeys.length === 0} onClick={() => handlePurge(selectedRowKeys)}>
-                批量物理擦除
-              </Button>
-            </Space>
-          </div>
-          <Table
-            rowKey="id"
-            columns={columns}
-            dataSource={recycledItems}
-            rowSelection={{
-              selectedRowKeys,
-              onChange: (keys) => setSelectedRowKeys(keys),
-            }}
-          />
-        </div>
+      label: `回收站 (${data.stats.recycledCount})`,
+      children: renderSnapshotTable(
+        <>
+          <Button
+            type="primary"
+            disabled={selectedRowKeys.length === 0}
+            onClick={() => handleRestore(selectedRowKeys)}
+          >
+            批量还原
+          </Button>
+          <Button danger disabled={selectedRowKeys.length === 0} onClick={() => handlePurge(selectedRowKeys)}>
+            批量彻底删除
+          </Button>
+        </>,
       ),
     },
     {
@@ -1543,7 +1459,15 @@ export const AttachmentCleanerPage: React.FC = () => {
           </Space>
         }
       >
-        <Tabs defaultActiveKey="all" items={tabItems} />
+        <Tabs
+          defaultActiveKey="all"
+          items={tabItems}
+          onChange={(k) => {
+            setActiveTabKey(k);
+            setSelectedRowKeys([]);
+            fetchSnapshotPageRef.current({ page: 1, filter: TAB_FILTER_MAP[k] ?? 'all' });
+          }}
+        />
       </Card>
 
       {/* 文件替换弹窗 */}
@@ -1652,17 +1576,17 @@ export const AttachmentCleanerPage: React.FC = () => {
                           <Select
                             showSearch
                             placeholder="输入文件名或 ID 搜索目标附件..."
-                            filterOption={(input, option) =>
-                              String(option?.label || '').toLowerCase().includes(input.toLowerCase())
-                            }
+                            filterOption={false}
                             value={replaceTargetId}
                             onChange={(val) => setReplaceTargetId(val)}
-                            options={items
-                              .filter((item) => String(item.id) !== String(currentReplaceRecord.id) && !item.isRecycled)
-                              .map((item) => ({
-                                value: item.id,
-                                label: `${item.title || item.filename} (ID: ${item.id}, ${formatSize(item.size)})`,
-                              }))}
+                            onSearch={(input) => fetchReplaceTargets(input)}
+                            onDropdownVisibleChange={(open) => {
+                              if (open) {
+                                fetchReplaceTargets('');
+                              }
+                            }}
+                            options={replaceTargetOptions}
+                            notFoundContent={replaceSubmitting ? '搜索中...' : '未找到匹配的附件'}
                           />
                         </Form.Item>
                         <Form.Item>
@@ -1916,9 +1840,6 @@ export const AttachmentCleanerPage: React.FC = () => {
                   <span style={{ color: '#888', marginLeft: 8 }}>(ID: {currentAuditLog.operatorId})</span>
                 )}
               </Descriptions.Item>
-              {currentAuditLog.ip && (
-                <Descriptions.Item label="客户端 IP">{currentAuditLog.ip}</Descriptions.Item>
-              )}
               <Descriptions.Item label="动作类型">
                 <Tag color={auditActionMeta[currentAuditLog.action]?.color}>
                   {auditActionMeta[currentAuditLog.action]?.label || currentAuditLog.action}
