@@ -1403,7 +1403,9 @@ export class AttachmentCleanerService {
         }
         let copied = false;
         try {
-          const fileManagerPlugin = this.app.pm.get(PluginFileManagerServer) as any;
+          const fileManagerPlugin = (this.app.pm.get('file-manager') ||
+            this.app.pm.get('@nocobase/plugin-file-manager') ||
+            this.app.pm.get(PluginFileManagerServer as any)) as any;
           const StorageClass = fileManagerPlugin?.storageTypes?.get?.(storage.get('type'));
           if (StorageClass) {
             const storageInstance = new StorageClass(storage.get({ plain: true }));

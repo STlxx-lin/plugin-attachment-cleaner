@@ -198,7 +198,10 @@ export class AttachmentAnalyzer {
     }
     let fileManagerPlugin: any = null;
     try {
-      fileManagerPlugin = this.app.pm.get(PluginFileManagerServer);
+      fileManagerPlugin =
+        this.app.pm.get('file-manager') ||
+        this.app.pm.get('@nocobase/plugin-file-manager') ||
+        (this.app.pm.get(PluginFileManagerServer as any) as any);
     } catch {
       return null;
     }
